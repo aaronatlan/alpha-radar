@@ -1,0 +1,50 @@
+[project]
+name = "alpha-radar"
+version = "0.1.0"
+description = "Système d'analyse d'investissement multi-sources détectant les opportunités avant le marché."
+requires-python = ">=3.11"
+authors = [{ name = "Aaron" }]
+readme = "README.md"
+
+# Phase 1 uniquement. Les phases suivantes ajouteront les dépendances
+# ML (scikit-learn, xgboost, transformers) et dashboard (streamlit).
+dependencies = [
+    "arxiv>=2.1.0",
+    "yfinance>=0.2.40",
+    "pandas>=2.1",
+    "sqlalchemy>=2.0",
+    "apscheduler>=3.10",
+    "loguru>=0.7",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-mock>=3.12",
+    "ruff>=0.1",
+    "black>=23.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["config", "collectors", "memory", "scheduler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]

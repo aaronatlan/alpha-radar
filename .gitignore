@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+alpha_radar.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Venv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets
+.env
+
+# Données (potentiellement volumineuses, et point-in-time à reconstituer)
+data/raw/
+data/processed/
+data/cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Notebooks
+.ipynb_checkpoints/
+notebooks/**/output/
+
+# Modèles entraînés
+models/artifacts/
