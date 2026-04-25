@@ -10,15 +10,25 @@ persistées par les features / scorers.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Optional
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from config.sectors import SECTORS_BY_ID
 from config.watchlists import STOCK_WATCHLIST
-from memory.database import Feature, RawData, session_scope, utc_now
+from memory.database import (
+    Alert,
+    Evaluation,
+    Feature,
+    RawData,
+    SignalPerformance,
+    Thesis,
+    session_scope,
+    utc_now,
+)
 
 
 # --------------------------------------------------------------- helpers
@@ -172,3 +182,276 @@ def get_feature_freshness() -> pd.DataFrame:
             "feature_name", "target_type", "n_targets", "last_computed_at",
         ],
     ).sort_values(["target_type", "feature_name"])
+
+
+# -------------------------------------------------------------- performance
+
+
+def get_performance_summary() -> dict[str, Any]:
+    """KPIs globaux du track record.
+
+    Retourne un dictionnaire avec :
+    - n_theses : total de thèses générées
+    - n_evaluated : thèses ayant au moins une évaluation non-active
+    - n_success / n_failure / n_partial : par statut terminal (horizon 180+)
+    - success_rate : n_success / (n_success + n_failure + n_partial)
+    - avg_alpha : alpha moyen sur les évaluations 180+ avec alpha connu
+    """
+    terminal = ("success", "failure", "partial")
+    with session_scope() as session:
+        n_theses = session.query(func.count(Thesis.id)).scalar() or 0
+
+        # Thèses avec au moins une éval terminale.
+        n_evaluated = session.execute(
+            select(func.count(func.distinct(Evaluation.thesis_id)))
+            .where(Evaluation.status.in_(terminal))
+        ).scalar() or 0
+
+        # Comptes par statut sur jalons ≥ 180j.
+        for status in terminal:
+            count = session.execute(
+                select(func.count(Evaluation.id))
+                .where(Evaluation.status == status)
+                .where(Evaluation.days_since_thesis >= 180)
+            ).scalar() or 0
+            if status == "success":
+                n_success = count
+            elif status == "failure":
+                n_failure = count
+            else:
+                n_partial = count
+
+        # Alpha moyen sur jalons ≥ 180j.
+        avg_alpha_raw = session.execute(
+            select(func.avg(Evaluation.alpha_pct))
+            .where(Evaluation.status.in_(terminal))
+            .where(Evaluation.days_since_thesis >= 180)
+            .where(Evaluation.alpha_pct.is_not(None))
+        ).scalar()
+
+    n_terminal = n_success + n_failure + n_partial
+    success_rate = n_success / n_terminal if n_terminal > 0 else None
+    return {
+        "n_theses": int(n_theses),
+        "n_evaluated": int(n_evaluated),
+        "n_success": int(n_success),
+        "n_failure": int(n_failure),
+        "n_partial": int(n_partial),
+        "success_rate": float(success_rate) if success_rate is not None else None,
+        "avg_alpha": float(avg_alpha_raw) if avg_alpha_raw is not None else None,
+    }
+
+
+def get_signal_performance(
+    sector_id: str | None = "_all",
+) -> pd.DataFrame:
+    """Tableau signal_performance filtré par secteur.
+
+    Passe `sector_id=None` pour le vrai NULL SQL (tous secteurs agrégés).
+    Passe `sector_id="_all"` (défaut) pour idem via la sentinelle.
+    Retourne colonnes : signal_name, horizon_days, n_predictions,
+    n_successes, accuracy, avg_alpha, last_updated.
+    """
+    with session_scope() as session:
+        stmt = select(SignalPerformance)
+        if sector_id is None or sector_id == "_all":
+            stmt = stmt.where(SignalPerformance.sector_id.is_(None))
+        else:
+            stmt = stmt.where(SignalPerformance.sector_id == sector_id)
+        rows = session.execute(stmt).scalars().all()
+        data = [
+            {
+                "signal_name": r.signal_name,
+                "sector_id": r.sector_id,
+                "horizon_days": r.horizon_days,
+                "n_predictions": r.n_predictions,
+                "n_successes": r.n_successes,
+                "accuracy": r.accuracy,
+                "avg_alpha": r.avg_alpha,
+                "last_updated": r.last_updated,
+            }
+            for r in rows
+        ]
+    if not data:
+        return pd.DataFrame(columns=[
+            "signal_name", "sector_id", "horizon_days", "n_predictions",
+            "n_successes", "accuracy", "avg_alpha", "last_updated",
+        ])
+    return pd.DataFrame(data).sort_values(
+        ["horizon_days", "accuracy"], ascending=[True, False]
+    )
+
+
+def get_alpha_by_horizon() -> pd.DataFrame:
+    """Alpha moyen et taux de succès par jalon, tous secteurs confondus.
+
+    Colonnes : horizon_days, mean_alpha, success_rate, n_predictions.
+    Seules les évaluations terminales avec alpha connu sont incluses.
+    """
+    terminal = ("success", "failure", "partial")
+    with session_scope() as session:
+        stmt = (
+            select(
+                Evaluation.days_since_thesis,
+                func.avg(Evaluation.alpha_pct).label("mean_alpha"),
+                func.count(Evaluation.id).label("n_predictions"),
+                func.sum(
+                    (Evaluation.status == "success").cast(type_=None)
+                    if False else func.cast(
+                        Evaluation.status == "success", type_=None
+                    )
+                ).label("n_success_raw"),
+            )
+            .where(Evaluation.status.in_(terminal))
+            .group_by(Evaluation.days_since_thesis)
+            .order_by(Evaluation.days_since_thesis)
+        )
+        # Simpler: fetch raw and compute in pandas.
+        raw_stmt = (
+            select(
+                Evaluation.days_since_thesis,
+                Evaluation.status,
+                Evaluation.alpha_pct,
+            )
+            .where(Evaluation.status.in_(terminal))
+        )
+        rows = session.execute(raw_stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "horizon_days", "mean_alpha", "success_rate", "n_predictions"
+        ])
+
+    df = pd.DataFrame(rows, columns=["horizon_days", "status", "alpha_pct"])
+    agg = (
+        df.groupby("horizon_days")
+        .agg(
+            mean_alpha=("alpha_pct", "mean"),
+            n_predictions=("alpha_pct", "count"),
+            n_success=("status", lambda s: (s == "success").sum()),
+        )
+        .reset_index()
+    )
+    agg["success_rate"] = agg["n_success"] / agg["n_predictions"]
+    return agg[["horizon_days", "mean_alpha", "success_rate", "n_predictions"]]
+
+
+# --------------------------------------------------------------- alerts
+
+
+def get_alerts(
+    *,
+    severity: str | None = None,
+    sector_id: str | None = None,
+    acknowledged: bool | None = None,
+    limit: int = 200,
+) -> pd.DataFrame:
+    """Alertes filtrables.
+
+    Colonnes : id, created_at, rule_name, severity, asset_id, sector_id,
+    message, thesis_id, acknowledged.
+    """
+    with session_scope() as session:
+        stmt = select(Alert).order_by(Alert.created_at.desc()).limit(limit)
+        if severity is not None:
+            stmt = stmt.where(Alert.severity == severity)
+        if sector_id is not None:
+            stmt = stmt.where(Alert.sector_id == sector_id)
+        if acknowledged is not None:
+            stmt = stmt.where(Alert.acknowledged == acknowledged)
+        rows = session.execute(stmt).scalars().all()
+        data = [
+            {
+                "id": r.id,
+                "created_at": r.created_at,
+                "rule_name": r.rule_name,
+                "severity": r.severity,
+                "asset_id": r.asset_id,
+                "sector_id": r.sector_id,
+                "message": r.message,
+                "thesis_id": r.thesis_id,
+                "acknowledged": r.acknowledged,
+            }
+            for r in rows
+        ]
+    if not data:
+        return pd.DataFrame(columns=[
+            "id", "created_at", "rule_name", "severity",
+            "asset_id", "sector_id", "message", "thesis_id", "acknowledged",
+        ])
+    return pd.DataFrame(data)
+
+
+def acknowledge_alert(alert_id: int) -> bool:
+    """Marque une alerte comme traitée. Retourne True si trouvée."""
+    with session_scope() as session:
+        stmt = (
+            update(Alert)
+            .where(Alert.id == alert_id)
+            .values(acknowledged=True)
+        )
+        result = session.execute(stmt)
+    return (result.rowcount or 0) > 0
+
+
+# --------------------------------------------------------------- theses history
+
+
+def get_theses_history(
+    *,
+    status_filter: list[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> pd.DataFrame:
+    """Historique complet des thèses avec leur dernier statut d'évaluation.
+
+    Colonnes : thesis_id, asset_id, sector_id, recommendation, score,
+    created_at, entry_price, latest_status, latest_days, latest_alpha.
+    `latest_*` est None si aucune évaluation n'existe encore.
+    """
+    with session_scope() as session:
+        # Sous-requête : dernier jalon évalué par thèse.
+        sub = (
+            select(
+                Evaluation.thesis_id,
+                func.max(Evaluation.days_since_thesis).label("max_days"),
+            )
+            .group_by(Evaluation.thesis_id)
+            .subquery()
+        )
+        stmt = (
+            select(
+                Thesis.id,
+                Thesis.asset_id,
+                Thesis.sector_id,
+                Thesis.recommendation,
+                Thesis.score,
+                Thesis.created_at,
+                Thesis.entry_price,
+                Evaluation.status,
+                Evaluation.days_since_thesis,
+                Evaluation.alpha_pct,
+            )
+            .outerjoin(sub, sub.c.thesis_id == Thesis.id)
+            .outerjoin(
+                Evaluation,
+                (Evaluation.thesis_id == Thesis.id)
+                & (Evaluation.days_since_thesis == sub.c.max_days),
+            )
+            .order_by(Thesis.created_at.desc())
+        )
+        if date_from is not None:
+            stmt = stmt.where(Thesis.created_at >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(Thesis.created_at <= date_to)
+        rows = session.execute(stmt).all()
+
+    cols = [
+        "thesis_id", "asset_id", "sector_id", "recommendation", "score",
+        "created_at", "entry_price", "latest_status",
+        "latest_days", "latest_alpha",
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    if status_filter:
+        df = df[df["latest_status"].isin(status_filter)]
+    return df
