@@ -32,6 +32,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import select
 
+from config.pdufa_calendar import upcoming_pdufas
 from memory.database import (
     Evaluation,
     Feature,
@@ -51,6 +52,10 @@ DEFAULT_VERDICT_STATUSES: tuple[str, ...] = ("success", "failure")
 #: fenêtre `surge_window_hours` qui déclenche une alerte critique.
 DEFAULT_HEAT_SURGE_DELTA = 20.0
 DEFAULT_HEAT_SURGE_WINDOW_HOURS = 48
+
+#: Seuil par défaut SPEC §7.7 : PDUFA <30 j avec score >70 = critique.
+DEFAULT_PDUFA_DAYS_AHEAD = 30
+DEFAULT_PDUFA_SCORE_THRESHOLD = 70.0
 
 
 # ----------------------------------------------------------------- types
@@ -302,12 +307,101 @@ class SectorHeatSurgeRule(Rule):
             return float(row[0]), row[1]
 
 
+class PDUFANearRule(Rule):
+    """Émet une alerte critique pour chaque PDUFA proche d'un actif scoré.
+
+    Source du calendrier : `config/pdufa_calendar.py` (manuel — voir le
+    docstring du module pour la justification). Pour chaque PDUFA dont
+    la date est dans `[as_of, as_of + days_ahead]` jours :
+
+    1. on récupère le dernier `stock_score` du ticker (PIT à `as_of`),
+    2. si `score >= score_threshold`, on émet l'alerte,
+    3. dedupe_key = `pdufa:{ticker}:{date}` (une alerte par PDUFA, jamais
+       répétée même si la PDUFA approche jour après jour).
+    """
+
+    name = "pdufa_near"
+    severity = "critical"
+    feature_name = "stock_score"
+
+    def __init__(
+        self,
+        *,
+        days_ahead: int = DEFAULT_PDUFA_DAYS_AHEAD,
+        score_threshold: float = DEFAULT_PDUFA_SCORE_THRESHOLD,
+    ) -> None:
+        if days_ahead <= 0:
+            raise ValueError("days_ahead doit être strictement positif")
+        self._days_ahead = int(days_ahead)
+        self._threshold = float(score_threshold)
+
+    def evaluate(self, as_of: datetime) -> list[AlertCandidate]:
+        as_of_date = as_of.date()
+        horizon_date = as_of_date + timedelta(days=self._days_ahead)
+        out: list[AlertCandidate] = []
+        for entry in upcoming_pdufas(as_of_date):
+            try:
+                pdufa_date = datetime.strptime(
+                    entry["target_action_date"], "%Y-%m-%d"
+                ).date()
+            except (KeyError, ValueError):
+                continue
+            if pdufa_date > horizon_date:
+                continue   # trop loin pour alerter
+            score = self._latest_score(entry["ticker"], as_of)
+            if score is None or score < self._threshold:
+                continue
+            days_left = (pdufa_date - as_of_date).days
+            drug = entry.get("drug", "n/a")
+            msg = (
+                f"PDUFA dans {days_left} j sur {entry['ticker']} "
+                f"({drug}) — score {score:.1f}/100. "
+                f"Date cible : {entry['target_action_date']}."
+            )
+            out.append(AlertCandidate(
+                rule_name=self.name,
+                severity=self.severity,
+                message=msg,
+                dedupe_key=(
+                    f"pdufa:{entry['ticker']}:{entry['target_action_date']}"
+                ),
+                asset_type="stock",
+                asset_id=entry["ticker"],
+                data={
+                    "pdufa_date": entry["target_action_date"],
+                    "days_left": days_left,
+                    "score": float(score),
+                    "drug": drug,
+                    "indication": entry.get("indication"),
+                },
+            ))
+        return out
+
+    def _latest_score(
+        self, ticker: str, as_of: datetime,
+    ) -> float | None:
+        """Dernière feature `stock_score` PIT pour `ticker`."""
+        stmt = (
+            select(Feature.value)
+            .where(Feature.feature_name == self.feature_name)
+            .where(Feature.target_type == "asset")
+            .where(Feature.target_id == ticker)
+            .where(Feature.computed_at <= as_of)
+            .order_by(Feature.computed_at.desc())
+            .limit(1)
+        )
+        with session_scope() as session:
+            row = session.execute(stmt).first()
+            return float(row[0]) if row is not None else None
+
+
 #: Règles activées par défaut dans `AlertsEngine`. Ajouter ici les futures
-#: règles Phase 4 (Form 13D, PDUFA, citations…).
+#: règles Phase 4+ (Form 13D, citations papers, contrats gouv…).
 DEFAULT_RULES: list[Rule] = [
     NewThesisRule(),
     EvaluationVerdictRule(),
     SectorHeatSurgeRule(),
+    PDUFANearRule(),
 ]
 
 
@@ -317,9 +411,12 @@ __all__ = [
     "NewThesisRule",
     "EvaluationVerdictRule",
     "SectorHeatSurgeRule",
+    "PDUFANearRule",
     "DEFAULT_RULES",
     "DEFAULT_NEW_THESIS_SCORE",
     "DEFAULT_VERDICT_STATUSES",
     "DEFAULT_HEAT_SURGE_DELTA",
     "DEFAULT_HEAT_SURGE_WINDOW_HOURS",
+    "DEFAULT_PDUFA_DAYS_AHEAD",
+    "DEFAULT_PDUFA_SCORE_THRESHOLD",
 ]

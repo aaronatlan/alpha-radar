@@ -10,6 +10,7 @@ from alerts.rules import (
     AlertCandidate,
     EvaluationVerdictRule,
     NewThesisRule,
+    PDUFANearRule,
     SectorHeatSurgeRule,
 )
 from memory.database import (
@@ -284,3 +285,127 @@ def test_heat_surge_invalid_args_raise():
         SectorHeatSurgeRule(delta_threshold=-5)
     with pytest.raises(ValueError):
         SectorHeatSurgeRule(window_hours=0)
+
+
+# ----------------------------------------------------------- PDUFANearRule
+
+
+def _seed_score(ticker: str, value: float, ts: datetime) -> None:
+    """Seed une feature stock_score pour `ticker`."""
+    with session_scope() as s:
+        s.add(Feature(
+            feature_name="stock_score",
+            target_type="asset",
+            target_id=ticker,
+            computed_at=ts,
+            value=value,
+            metadata_json=None,
+        ))
+
+
+def test_pdufa_near_rule_emits_when_within_window_and_score_high(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    pdufa = [{
+        "ticker": "MRNA",
+        "target_action_date": "2026-05-10",
+        "drug": "mRNA-1234",
+        "indication": "Cancer du poumon",
+    }]
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: pdufa)
+
+    _seed_score("MRNA", 80.0, datetime(2026, 4, 25))
+    cands = PDUFANearRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    c = cands[0]
+    assert c.severity == "critical"
+    assert c.asset_id == "MRNA"
+    assert "MRNA" in c.message
+    assert c.data["days_left"] == 15
+    assert c.data["score"] == 80.0
+
+
+def test_pdufa_near_rule_skips_when_score_below_threshold(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: [{
+        "ticker": "MRNA",
+        "target_action_date": "2026-05-10",
+        "drug": "X",
+    }])
+    _seed_score("MRNA", 65.0, datetime(2026, 4, 25))   # < 70
+    cands = PDUFANearRule().evaluate(datetime(2026, 4, 25))
+    assert cands == []
+
+
+def test_pdufa_near_rule_skips_when_pdufa_too_far(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: [{
+        "ticker": "MRNA",
+        "target_action_date": "2026-08-01",   # >30 j
+        "drug": "X",
+    }])
+    _seed_score("MRNA", 85.0, datetime(2026, 4, 25))
+    cands = PDUFANearRule().evaluate(datetime(2026, 4, 25))
+    assert cands == []
+
+
+def test_pdufa_near_rule_skips_when_no_score_yet(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: [{
+        "ticker": "MRNA",
+        "target_action_date": "2026-05-10",
+        "drug": "X",
+    }])
+    # Pas de seed → score introuvable.
+    cands = PDUFANearRule().evaluate(datetime(2026, 4, 25))
+    assert cands == []
+
+
+def test_pdufa_near_rule_dedupe_key_per_pdufa_date(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: [{
+        "ticker": "MRNA",
+        "target_action_date": "2026-05-10",
+        "drug": "X",
+    }])
+    _seed_score("MRNA", 80.0, datetime(2026, 4, 25))
+    c = PDUFANearRule().evaluate(datetime(2026, 4, 25))[0]
+    assert c.dedupe_key == "pdufa:MRNA:2026-05-10"
+
+
+def test_pdufa_near_rule_skips_invalid_date(
+    tmp_db, monkeypatch,
+):
+    from alerts import rules as rules_mod
+    monkeypatch.setattr(rules_mod, "upcoming_pdufas", lambda d: [{
+        "ticker": "MRNA",
+        "target_action_date": "not-a-date",
+        "drug": "X",
+    }])
+    _seed_score("MRNA", 80.0, datetime(2026, 4, 25))
+    assert PDUFANearRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_pdufa_near_rule_invalid_args_raise():
+    with pytest.raises(ValueError):
+        PDUFANearRule(days_ahead=0)
+    with pytest.raises(ValueError):
+        PDUFANearRule(days_ahead=-5)
+
+
+def test_pdufa_calendar_helper_filters_past():
+    from datetime import date
+
+    from config.pdufa_calendar import upcoming_pdufas
+
+    # Avec un calendrier vide (état initial Phase 4), helper renvoie [].
+    assert upcoming_pdufas(date(2026, 4, 25)) == []

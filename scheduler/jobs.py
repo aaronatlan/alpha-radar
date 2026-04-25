@@ -15,6 +15,7 @@ Cadences choisies (heure Europe/Paris) :
   ---------
   06:00 quotidien  — arXiv (48 h)
   06:30 quotidien  — ClinicalTrials.gov (fenêtre 7 j sur lastUpdatePostDate)
+  06:45 quotidien  — FDA approvals (fenêtre 30 j sur submission_status_date)
   07:00 quotidien  — CoinGecko (snapshot spot, un par jour UTC)
   07:30 quotidien  — GitHub (snapshot stars / forks, un par jour UTC)
   08:00 quotidien  — SEC EDGAR (fenêtre 7 j)
@@ -47,6 +48,7 @@ from loguru import logger
 from collectors.arxiv_collector import ArxivCollector
 from collectors.clinicaltrials_collector import ClinicalTrialsCollector
 from collectors.coingecko_collector import CoinGeckoCollector
+from collectors.fda_collector import FDACollector
 from collectors.github_collector import GitHubCollector
 from collectors.news_collector import NewsAPICollector
 from collectors.sec_edgar_collector import SECEdgarCollector
@@ -88,6 +90,13 @@ def run_arxiv_job() -> None:
 def run_clinicaltrials_job() -> None:
     # Fenêtre de 7 j sur lastUpdatePostDate avec chevauchement.
     _run_collector("clinicaltrials", ClinicalTrialsCollector, days=7)
+
+
+def run_fda_job() -> None:
+    # Fenêtre 30 j : les approvals sont peu fréquents par sponsor, on
+    # élargit la fenêtre pour capter les rattrapages tout en restant
+    # idempotent (entity_id = application+submission, hash inchangé).
+    _run_collector("fda", FDACollector, days=30)
 
 
 def run_yfinance_job() -> None:
@@ -203,6 +212,13 @@ def build_scheduler() -> BlockingScheduler:
         trigger=CronTrigger(hour=6, minute=30),
         id="clinicaltrials_daily",
         name="ClinicalTrials.gov daily",
+        replace_existing=True,
+    )
+    sched.add_job(
+        run_fda_job,
+        trigger=CronTrigger(hour=6, minute=45),
+        id="fda_daily",
+        name="FDA approvals daily",
         replace_existing=True,
     )
     sched.add_job(
