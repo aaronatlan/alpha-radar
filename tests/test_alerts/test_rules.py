@@ -9,6 +9,7 @@ import pytest
 from alerts.rules import (
     AlertCandidate,
     EvaluationVerdictRule,
+    LargeGovContractRule,
     NewThesisRule,
     PDUFANearRule,
     SectorHeatSurgeRule,
@@ -16,6 +17,7 @@ from alerts.rules import (
 from memory.database import (
     Evaluation,
     Feature,
+    RawData,
     Thesis,
     session_scope,
 )
@@ -409,3 +411,107 @@ def test_pdufa_calendar_helper_filters_past():
 
     # Avec un calendrier vide (état initial Phase 4), helper renvoie [].
     assert upcoming_pdufas(date(2026, 4, 25)) == []
+
+
+# -------------------------------------------------------- LargeGovContractRule
+
+
+def _seed_contract(
+    *,
+    award_id: str = "A1",
+    amount: float = 250_000_000.0,
+    ticker: str = "LMT",
+    recipient: str = "Lockheed Martin",
+    agency: str = "DoD",
+    description: str | None = "F-35 procurement",
+    content_at: datetime | None = None,
+) -> None:
+    """Insère une ligne raw_data simulant un contrat USASpending."""
+    payload = {
+        "ticker": ticker,
+        "award_id": award_id,
+        "award_amount": amount,
+        "recipient_name": recipient,
+        "awarding_agency": agency,
+        "description": description,
+        "action_date": (content_at or datetime(2026, 4, 20)).date().isoformat(),
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="usaspending",
+            entity_type="gov_contract",
+            entity_id=award_id,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{award_id}",
+        ))
+
+
+def test_large_contract_emits_above_threshold(tmp_db):
+    _seed_contract(amount=250_000_000.0)
+    cands = LargeGovContractRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    c = cands[0]
+    assert c.severity == "warning"
+    assert c.asset_id == "LMT"
+    assert "250" in c.message  # amount /1e6 = 250.0
+    assert c.dedupe_key.startswith("contract:")
+
+
+def test_large_contract_skips_below_threshold(tmp_db):
+    _seed_contract(amount=50_000_000.0)
+    assert LargeGovContractRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_large_contract_skips_when_amount_none(tmp_db):
+    _seed_contract(amount=None)  # type: ignore[arg-type]
+    assert LargeGovContractRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_large_contract_respects_lookback(tmp_db):
+    """Contrat hors fenêtre lookback → pas d'alerte."""
+    _seed_contract(amount=200_000_000.0,
+                   content_at=datetime(2026, 1, 1))   # >7j avant as_of
+    rule = LargeGovContractRule(lookback_days=7)
+    assert rule.evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_large_contract_dedupe_key_uses_award_id(tmp_db):
+    _seed_contract(award_id="FA8625-21-C-0001", amount=200_000_000.0)
+    c = LargeGovContractRule().evaluate(datetime(2026, 4, 25))[0]
+    assert c.dedupe_key == "contract:FA8625-21-C-0001"
+
+
+def test_large_contract_skips_malformed_payload(tmp_db):
+    """Payload JSON cassé → pas de crash, pas d'alerte."""
+    with session_scope() as s:
+        s.add(RawData(
+            source="usaspending", entity_type="gov_contract",
+            entity_id="bad", fetched_at=datetime(2026, 4, 20),
+            content_at=datetime(2026, 4, 20),
+            payload_json="not a json",
+            hash="h-bad",
+        ))
+    assert LargeGovContractRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_large_contract_custom_threshold(tmp_db):
+    _seed_contract(amount=10_000_000.0)
+    rule = LargeGovContractRule(threshold_usd=5_000_000.0)
+    assert len(rule.evaluate(datetime(2026, 4, 25))) == 1
+
+
+def test_large_contract_invalid_args_raise():
+    with pytest.raises(ValueError):
+        LargeGovContractRule(threshold_usd=0)
+    with pytest.raises(ValueError):
+        LargeGovContractRule(threshold_usd=-1)
+    with pytest.raises(ValueError):
+        LargeGovContractRule(lookback_days=0)
+
+
+def test_large_contract_message_includes_amount_in_millions(tmp_db):
+    _seed_contract(amount=125_500_000.0)
+    c = LargeGovContractRule().evaluate(datetime(2026, 4, 25))[0]
+    assert "125.5M" in c.message

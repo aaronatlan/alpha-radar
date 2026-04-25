@@ -30,12 +30,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
+import json as _json
+
 from sqlalchemy import select
 
 from config.pdufa_calendar import upcoming_pdufas
 from memory.database import (
     Evaluation,
     Feature,
+    RawData,
     Thesis,
     session_scope,
 )
@@ -56,6 +59,10 @@ DEFAULT_HEAT_SURGE_WINDOW_HOURS = 48
 #: Seuil par défaut SPEC §7.7 : PDUFA <30 j avec score >70 = critique.
 DEFAULT_PDUFA_DAYS_AHEAD = 30
 DEFAULT_PDUFA_SCORE_THRESHOLD = 70.0
+
+#: Seuil contrat gouv US (USD). SPEC §7.7 : >100M$ → warning.
+DEFAULT_LARGE_CONTRACT_THRESHOLD = 100_000_000.0
+DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS = 7
 
 
 # ----------------------------------------------------------------- types
@@ -395,13 +402,94 @@ class PDUFANearRule(Rule):
             return float(row[0]) if row is not None else None
 
 
+class LargeGovContractRule(Rule):
+    """Émet une alerte warning quand un contrat gouv US dépasse un seuil.
+
+    Lit `raw_data` filtré sur `entity_type='gov_contract'` (alimenté par
+    `USASpendingCollector`). Pour chaque contrat avec
+    `award_amount >= threshold` reçu sur la fenêtre `lookback_days`,
+    une alerte est émise. Dedupe par `award_id` — un même contrat ne
+    génère qu'une alerte, même si re-collecté plusieurs fois.
+    """
+
+    name = "large_gov_contract"
+    severity = "warning"
+    source_name = "usaspending"
+    entity_type = "gov_contract"
+
+    def __init__(
+        self,
+        *,
+        threshold_usd: float = DEFAULT_LARGE_CONTRACT_THRESHOLD,
+        lookback_days: int = DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS,
+    ) -> None:
+        if threshold_usd <= 0:
+            raise ValueError("threshold_usd doit être strictement positif")
+        if lookback_days <= 0:
+            raise ValueError("lookback_days doit être strictement positif")
+        self._threshold = float(threshold_usd)
+        self._lookback_days = int(lookback_days)
+
+    def evaluate(self, as_of: datetime) -> list[AlertCandidate]:
+        since = as_of - timedelta(days=self._lookback_days)
+        stmt = (
+            select(RawData.payload_json, RawData.content_at)
+            .where(RawData.source == self.source_name)
+            .where(RawData.entity_type == self.entity_type)
+            .where(RawData.content_at >= since)
+            .where(RawData.content_at <= as_of)
+            .order_by(RawData.content_at.asc())
+        )
+        with session_scope() as session:
+            rows = session.execute(stmt).all()
+
+        out: list[AlertCandidate] = []
+        for payload_json, content_at in rows:
+            try:
+                payload = _json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            amount = payload.get("award_amount")
+            if amount is None or amount < self._threshold:
+                continue
+            award_id = payload.get("award_id")
+            if not award_id:
+                continue
+            ticker = payload.get("ticker")
+            recipient = payload.get("recipient_name") or ticker or "—"
+            description = (payload.get("description") or "").strip()
+            agency = payload.get("awarding_agency") or "—"
+            msg = (
+                f"Contrat gouv US : {recipient} reçoit "
+                f"${amount / 1e6:.1f}M de {agency}"
+                + (f" — {description[:80]}…" if description else "")
+                + f" ({content_at.date().isoformat()})."
+            )
+            out.append(AlertCandidate(
+                rule_name=self.name,
+                severity=self.severity,
+                message=msg,
+                dedupe_key=f"contract:{award_id}",
+                asset_type="stock",
+                asset_id=ticker,
+                data={
+                    "award_id": str(award_id),
+                    "amount_usd": float(amount),
+                    "agency": agency,
+                    "action_date": payload.get("action_date"),
+                },
+            ))
+        return out
+
+
 #: Règles activées par défaut dans `AlertsEngine`. Ajouter ici les futures
-#: règles Phase 4+ (Form 13D, citations papers, contrats gouv…).
+#: règles Phase 4+ (Form 13D, citations papers, …).
 DEFAULT_RULES: list[Rule] = [
     NewThesisRule(),
     EvaluationVerdictRule(),
     SectorHeatSurgeRule(),
     PDUFANearRule(),
+    LargeGovContractRule(),
 ]
 
 
@@ -412,6 +500,7 @@ __all__ = [
     "EvaluationVerdictRule",
     "SectorHeatSurgeRule",
     "PDUFANearRule",
+    "LargeGovContractRule",
     "DEFAULT_RULES",
     "DEFAULT_NEW_THESIS_SCORE",
     "DEFAULT_VERDICT_STATUSES",
@@ -419,4 +508,6 @@ __all__ = [
     "DEFAULT_HEAT_SURGE_WINDOW_HOURS",
     "DEFAULT_PDUFA_DAYS_AHEAD",
     "DEFAULT_PDUFA_SCORE_THRESHOLD",
+    "DEFAULT_LARGE_CONTRACT_THRESHOLD",
+    "DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS",
 ]

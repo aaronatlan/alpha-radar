@@ -16,6 +16,7 @@ Cadences choisies (heure Europe/Paris) :
   06:00 quotidien  — arXiv (48 h)
   06:30 quotidien  — ClinicalTrials.gov (fenêtre 7 j sur lastUpdatePostDate)
   06:45 quotidien  — FDA approvals (fenêtre 30 j sur submission_status_date)
+  07:15 quotidien  — USASpending contrats gouv (fenêtre 14 j sur action_date)
   07:00 quotidien  — CoinGecko (snapshot spot, un par jour UTC)
   07:30 quotidien  — GitHub (snapshot stars / forks, un par jour UTC)
   08:00 quotidien  — SEC EDGAR (fenêtre 7 j)
@@ -49,6 +50,7 @@ from collectors.arxiv_collector import ArxivCollector
 from collectors.clinicaltrials_collector import ClinicalTrialsCollector
 from collectors.coingecko_collector import CoinGeckoCollector
 from collectors.fda_collector import FDACollector
+from collectors.usaspending_collector import USASpendingCollector
 from collectors.github_collector import GitHubCollector
 from collectors.news_collector import NewsAPICollector
 from collectors.sec_edgar_collector import SECEdgarCollector
@@ -97,6 +99,12 @@ def run_fda_job() -> None:
     # élargit la fenêtre pour capter les rattrapages tout en restant
     # idempotent (entity_id = application+submission, hash inchangé).
     _run_collector("fda", FDACollector, days=30)
+
+
+def run_usaspending_job() -> None:
+    # Fenêtre 14 j sur action_date : les contrats gouv arrivent par à-coups,
+    # 14 j couvre les week-ends + chevauchement quotidien.
+    _run_collector("usaspending", USASpendingCollector, days=14)
 
 
 def run_yfinance_job() -> None:
@@ -219,6 +227,13 @@ def build_scheduler() -> BlockingScheduler:
         trigger=CronTrigger(hour=6, minute=45),
         id="fda_daily",
         name="FDA approvals daily",
+        replace_existing=True,
+    )
+    sched.add_job(
+        run_usaspending_job,
+        trigger=CronTrigger(hour=7, minute=15),
+        id="usaspending_daily",
+        name="USASpending contracts daily",
         replace_existing=True,
     )
     sched.add_job(
