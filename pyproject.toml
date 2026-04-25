@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "python-dotenv>=1.0",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -27,13 +28,24 @@ dev = [
     "ruff>=0.1",
     "black>=23.0",
 ]
+# FinBERT (sentiment news) : lourd, gardé optionnel pour ne pas imposer
+# torch à toute installation. `pip install -e .[sentiment]` l'active.
+sentiment = [
+    "transformers>=4.36",
+    "torch>=2.1",
+]
+# Dashboard Streamlit — activé par `pip install -e .[dashboard]`.
+dashboard = [
+    "streamlit>=1.32",
+    "plotly>=5.18",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["config", "collectors", "memory", "scheduler"]
+packages = ["config", "collectors", "memory", "scheduler", "features", "scoring", "dashboard", "thesis", "alerts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
