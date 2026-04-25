@@ -41,3 +41,66 @@ STOCK_WATCHLIST: list[WatchlistItem] = [
 
 
 WATCHLIST_TICKERS: list[str] = [item["ticker"] for item in STOCK_WATCHLIST]
+
+
+# --- Crypto ---------------------------------------------------------------
+#
+# Identifiants CoinGecko (slugs officiels). Liste courte pour la Phase 2 :
+# on couvre les têtes de gondole et deux tokens "secteurs chauds" (IA).
+# Les prix / volumes seront collectés quotidiennement.
+
+
+class CryptoAsset(TypedDict):
+    coin_id: str         # id CoinGecko
+    symbol: str          # ticker (BTC, ETH...)
+    name: str
+    sectors: list[str]
+
+
+CRYPTO_WATCHLIST: list[CryptoAsset] = [
+    {"coin_id": "bitcoin", "symbol": "BTC", "name": "Bitcoin", "sectors": []},
+    {"coin_id": "ethereum", "symbol": "ETH", "name": "Ethereum", "sectors": []},
+    {"coin_id": "solana", "symbol": "SOL", "name": "Solana", "sectors": []},
+    {"coin_id": "render-token", "symbol": "RNDR", "name": "Render", "sectors": ["ai_ml"]},
+    {"coin_id": "fetch-ai", "symbol": "FET", "name": "Fetch.ai", "sectors": ["ai_ml"]},
+]
+
+
+CRYPTO_COIN_IDS: list[str] = [c["coin_id"] for c in CRYPTO_WATCHLIST]
+
+
+# --- Mapping ticker → CIK SEC --------------------------------------------
+#
+# L'API SEC EDGAR indexe les filings par CIK (Central Index Key) — pas par
+# ticker. On maintient un mapping local pour la watchlist Phase 2. La
+# source de vérité reste `https://www.sec.gov/files/company_tickers.json` ;
+# on pourra y rapatrier dynamiquement en cas de watchlist élargie.
+# CIKs doivent être stockés en string (préfixés de zéros si < 10 chiffres)
+# puisque l'URL EDGAR attend 10 digits.
+
+TICKER_TO_CIK: dict[str, str] = {
+    "NVDA":  "1045810",
+    "AMD":   "2488",
+    "GOOGL": "1652044",
+    "MSFT":  "789019",
+    "META":  "1326801",
+    "IBM":   "51143",
+    "IONQ":  "1824920",
+    "RGTI":  "1838359",
+    "PLTR":  "1321655",
+    "CRWD":  "1535527",
+    "PANW":  "1327567",
+    "ISRG":  "1035267",
+    "MRNA":  "1682852",
+    "CRSP":  "1674416",
+    "NTLA":  "1652130",
+    "RKLB":  "1819994",
+    "LMT":   "936468",
+    "TSLA":  "1318605",
+    "AAPL":  "320193",
+}
+
+
+def cik_padded(cik: str) -> str:
+    """SEC attend des CIK à 10 chiffres zéro-paddés."""
+    return cik.zfill(10)
