@@ -37,12 +37,14 @@ SPONSOR_NAME_OVERRIDES: dict[str, str] = {
     # Le nom officiel chez USASpending peut différer.
     "LMT": "Lockheed Martin",
     "RKLB": "Rocket Lab",
+    "RTX": "RTX Corporation",
+    "NOC": "Northrop Grumman",
+    "PLTR": "Palantir Technologies",
 }
 
-#: Secteurs de la watchlist contribuant au mapping par défaut. Étendre
-#: à `defense` / `cybersecurity` quand ces sectors / tickers seront
-#: ajoutés en Phase 4 Étape 5.
-DEFENSE_SECTORS: tuple[str, ...] = ("space",)
+#: Secteurs de la watchlist éligibles à la collecte de contrats fédéraux.
+#: `defense` couvre LMT, RTX, NOC, PLTR ; `space` ajoute RKLB.
+DEFENSE_SECTORS: tuple[str, ...] = ("space", "defense")
 
 
 def _defense_sponsors() -> dict[str, str]:

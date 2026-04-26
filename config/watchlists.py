@@ -18,15 +18,15 @@ class WatchlistItem(TypedDict):
 
 
 STOCK_WATCHLIST: list[WatchlistItem] = [
-    {"ticker": "NVDA", "name": "NVIDIA", "sectors": ["ai_ml"], "exchange": "NASDAQ"},
-    {"ticker": "AMD", "name": "Advanced Micro Devices", "sectors": ["ai_ml"], "exchange": "NASDAQ"},
+    {"ticker": "NVDA", "name": "NVIDIA", "sectors": ["ai_ml", "semiconductors"], "exchange": "NASDAQ"},
+    {"ticker": "AMD", "name": "Advanced Micro Devices", "sectors": ["ai_ml", "semiconductors"], "exchange": "NASDAQ"},
     {"ticker": "GOOGL", "name": "Alphabet", "sectors": ["ai_ml", "quantum_computing"], "exchange": "NASDAQ"},
     {"ticker": "MSFT", "name": "Microsoft", "sectors": ["ai_ml", "cybersecurity"], "exchange": "NASDAQ"},
     {"ticker": "META", "name": "Meta Platforms", "sectors": ["ai_ml", "computer_vision"], "exchange": "NASDAQ"},
     {"ticker": "IBM", "name": "IBM", "sectors": ["quantum_computing", "ai_ml"], "exchange": "NYSE"},
     {"ticker": "IONQ", "name": "IonQ", "sectors": ["quantum_computing"], "exchange": "NYSE"},
     {"ticker": "RGTI", "name": "Rigetti Computing", "sectors": ["quantum_computing"], "exchange": "NASDAQ"},
-    {"ticker": "PLTR", "name": "Palantir", "sectors": ["ai_ml", "cybersecurity"], "exchange": "NYSE"},
+    {"ticker": "PLTR", "name": "Palantir", "sectors": ["ai_ml", "cybersecurity", "defense"], "exchange": "NYSE"},
     {"ticker": "CRWD", "name": "CrowdStrike", "sectors": ["cybersecurity"], "exchange": "NASDAQ"},
     {"ticker": "PANW", "name": "Palo Alto Networks", "sectors": ["cybersecurity"], "exchange": "NASDAQ"},
     {"ticker": "ISRG", "name": "Intuitive Surgical", "sectors": ["robotics"], "exchange": "NASDAQ"},
@@ -34,9 +34,19 @@ STOCK_WATCHLIST: list[WatchlistItem] = [
     {"ticker": "CRSP", "name": "CRISPR Therapeutics", "sectors": ["biotech"], "exchange": "NASDAQ"},
     {"ticker": "NTLA", "name": "Intellia Therapeutics", "sectors": ["biotech"], "exchange": "NASDAQ"},
     {"ticker": "RKLB", "name": "Rocket Lab", "sectors": ["space"], "exchange": "NASDAQ"},
-    {"ticker": "LMT", "name": "Lockheed Martin", "sectors": ["space"], "exchange": "NYSE"},
+    {"ticker": "LMT", "name": "Lockheed Martin", "sectors": ["space", "defense"], "exchange": "NYSE"},
     {"ticker": "TSLA", "name": "Tesla", "sectors": ["robotics", "ai_ml"], "exchange": "NASDAQ"},
     {"ticker": "AAPL", "name": "Apple", "sectors": ["ai_ml"], "exchange": "NASDAQ"},
+    # --- Phase 4 extension : biotech / défense / cyber / semis ---
+    {"ticker": "BNTX", "name": "BioNTech", "sectors": ["biotech"], "exchange": "NASDAQ"},
+    {"ticker": "REGN", "name": "Regeneron Pharmaceuticals", "sectors": ["biotech"], "exchange": "NASDAQ"},
+    {"ticker": "RTX", "name": "RTX Corporation", "sectors": ["defense", "space"], "exchange": "NYSE"},
+    {"ticker": "NOC", "name": "Northrop Grumman", "sectors": ["defense", "space"], "exchange": "NYSE"},
+    {"ticker": "S", "name": "SentinelOne", "sectors": ["cybersecurity"], "exchange": "NYSE"},
+    {"ticker": "ZS", "name": "Zscaler", "sectors": ["cybersecurity"], "exchange": "NASDAQ"},
+    {"ticker": "NET", "name": "Cloudflare", "sectors": ["cybersecurity"], "exchange": "NYSE"},
+    {"ticker": "AVGO", "name": "Broadcom", "sectors": ["semiconductors", "ai_ml"], "exchange": "NASDAQ"},
+    {"ticker": "TSM", "name": "Taiwan Semiconductor", "sectors": ["semiconductors", "ai_ml"], "exchange": "NYSE"},
 ]
 
 
@@ -98,6 +108,16 @@ TICKER_TO_CIK: dict[str, str] = {
     "LMT":   "936468",
     "TSLA":  "1318605",
     "AAPL":  "320193",
+    # --- Phase 4 extension ---
+    "BNTX":  "1776985",
+    "REGN":  "872589",
+    "RTX":   "101829",
+    "NOC":   "1133421",
+    "S":     "1583708",
+    "ZS":    "1713683",
+    "NET":   "1477333",
+    "AVGO":  "1730168",
+    "TSM":   "1046179",
 }
 
 

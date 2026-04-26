@@ -8,8 +8,10 @@ import pytest
 
 from alerts.rules import (
     AlertCandidate,
+    BuybackMentionRule,
     CitationVelocityRule,
     EvaluationVerdictRule,
+    Form13DRule,
     LargeGovContractRule,
     NewThesisRule,
     PDUFANearRule,
@@ -636,3 +638,205 @@ def test_citation_velocity_invalid_args_raise():
         CitationVelocityRule(delta_threshold=-5)
     with pytest.raises(ValueError):
         CitationVelocityRule(window_days=0)
+
+
+# ----------------------------------------------------------- Form13DRule
+
+
+def _seed_sec_filing(
+    *,
+    accession: str = "0001000000-26-000001",
+    form: str = "SC 13D",
+    ticker: str = "NVDA",
+    company: str = "NVIDIA",
+    content_at: datetime | None = None,
+) -> None:
+    """Insère une ligne raw_data simulant un filing SEC EDGAR."""
+    payload = {
+        "accession": accession,
+        "form": form,
+        "ticker": ticker,
+        "company_name": company,
+        "filing_date": (content_at or datetime(2026, 4, 20)).date().isoformat(),
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="sec_edgar",
+            entity_type="sec_filing",
+            entity_id=accession,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{accession}",
+        ))
+
+
+def test_form_13d_emits_for_new_filing(tmp_db):
+    _seed_sec_filing(form="SC 13D", ticker="NVDA")
+    cands = Form13DRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    c = cands[0]
+    assert c.severity == "critical"
+    assert c.asset_id == "NVDA"
+    assert "SC 13D" in c.message
+    assert c.dedupe_key.startswith("13d:")
+
+
+def test_form_13d_emits_for_amended(tmp_db):
+    _seed_sec_filing(form="SC 13D/A", accession="0001-26-000099")
+    cands = Form13DRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    assert "SC 13D/A" in cands[0].message
+
+
+def test_form_13d_skips_other_forms(tmp_db):
+    _seed_sec_filing(form="10-K")
+    _seed_sec_filing(form="SC 13G", accession="diff")
+    assert Form13DRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_form_13d_respects_lookback(tmp_db):
+    _seed_sec_filing(form="SC 13D", content_at=datetime(2026, 1, 1))
+    rule = Form13DRule(lookback_days=7)
+    assert rule.evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_form_13d_dedupe_key_uses_accession(tmp_db):
+    _seed_sec_filing(form="SC 13D", accession="myaccession")
+    c = Form13DRule().evaluate(datetime(2026, 4, 25))[0]
+    assert c.dedupe_key == "13d:myaccession"
+
+
+def test_form_13d_invalid_args_raise():
+    with pytest.raises(ValueError):
+        Form13DRule(lookback_days=0)
+    with pytest.raises(ValueError):
+        Form13DRule(lookback_days=-1)
+
+
+def test_form_13d_skips_malformed_payload(tmp_db):
+    with session_scope() as s:
+        s.add(RawData(
+            source="sec_edgar", entity_type="sec_filing",
+            entity_id="bad", fetched_at=datetime(2026, 4, 20),
+            content_at=datetime(2026, 4, 20),
+            payload_json="not a json",
+            hash="h-bad",
+        ))
+    assert Form13DRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+# --------------------------------------------------- BuybackMentionRule
+
+
+def _seed_news(
+    *,
+    url: str = "https://x.com/article-1",
+    title: str = "",
+    description: str = "",
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "url": url,
+        "title": title,
+        "description": description,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="newsapi",
+            entity_type="article",
+            entity_id=url,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{url}",
+        ))
+
+
+def test_buyback_emits_when_keyword_and_company_match(tmp_db):
+    _seed_news(
+        url="https://example.com/a1",
+        title="NVIDIA announces $50B share repurchase program",
+        description="The chipmaker boosts its buyback authorization.",
+    )
+    cands = BuybackMentionRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    c = cands[0]
+    assert c.severity == "warning"
+    assert c.asset_id == "NVDA"
+    assert "buyback" in c.message.lower()
+
+
+def test_buyback_skips_news_without_keyword(tmp_db):
+    _seed_news(
+        title="NVIDIA reports strong earnings",
+        description="Revenue beat expectations.",
+    )
+    assert BuybackMentionRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_buyback_skips_news_without_watchlist_match(tmp_db):
+    """Buyback mentionné mais pas de société watchlist → skip."""
+    _seed_news(
+        title="ExxonMobil announces share repurchase",
+        description="Oil major returns capital.",
+    )
+    assert BuybackMentionRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_buyback_dedupe_key_uses_url(tmp_db):
+    _seed_news(
+        url="https://x.com/unique",
+        title="Apple share buyback expanded",
+    )
+    c = BuybackMentionRule().evaluate(datetime(2026, 4, 25))[0]
+    assert c.dedupe_key == "buyback:AAPL:https://x.com/unique"
+
+
+def test_buyback_respects_lookback(tmp_db):
+    _seed_news(
+        title="NVIDIA buyback program",
+        content_at=datetime(2026, 1, 1),
+    )
+    rule = BuybackMentionRule(lookback_days=7)
+    assert rule.evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_buyback_handles_multiple_keywords(tmp_db):
+    """rachat d'actions (FR) doit aussi matcher."""
+    _seed_news(
+        title="NVIDIA annonce un rachat d'actions",
+        description="Programme de retour aux actionnaires.",
+    )
+    cands = BuybackMentionRule().evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+
+
+def test_buyback_invalid_args_raise():
+    with pytest.raises(ValueError):
+        BuybackMentionRule(lookback_days=0)
+    with pytest.raises(ValueError):
+        BuybackMentionRule(keywords=())
+
+
+def test_buyback_skips_malformed_payload(tmp_db):
+    with session_scope() as s:
+        s.add(RawData(
+            source="newsapi", entity_type="article",
+            entity_id="bad", fetched_at=datetime(2026, 4, 20),
+            content_at=datetime(2026, 4, 20),
+            payload_json="not a json",
+            hash="h-bad",
+        ))
+    assert BuybackMentionRule().evaluate(datetime(2026, 4, 25)) == []
+
+
+def test_buyback_uses_custom_ticker_map(tmp_db):
+    _seed_news(
+        title="ACME Corp announces share buyback",
+        description="ACME plans $1B repurchase.",
+    )
+    rule = BuybackMentionRule(ticker_to_company={"ACME": "ACME Corp"})
+    cands = rule.evaluate(datetime(2026, 4, 25))
+    assert len(cands) == 1
+    assert cands[0].asset_id == "ACME"

@@ -68,6 +68,18 @@ DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS = 7
 DEFAULT_CITATION_VELOCITY_DELTA = 100
 DEFAULT_CITATION_VELOCITY_WINDOW_DAYS = 7
 
+#: Lookback Form 13D : un nouveau filing 13D/13D-A déclenche l'alerte.
+DEFAULT_FORM_13D_LOOKBACK_DAYS = 7
+
+#: Lookback Buyback mentions news.
+DEFAULT_BUYBACK_LOOKBACK_DAYS = 7
+
+#: Mots-clés détectant un buyback / programme de rachat dans un article.
+DEFAULT_BUYBACK_KEYWORDS: tuple[str, ...] = (
+    "buyback", "share repurchase", "stock repurchase",
+    "rachat d'actions", "share buyback program",
+)
+
 
 # ----------------------------------------------------------------- types
 
@@ -594,8 +606,203 @@ class CitationVelocityRule(Rule):
         return out
 
 
-#: Règles activées par défaut dans `AlertsEngine`. Ajouter ici les futures
-#: règles (Form 13D buybacks…).
+class Form13DRule(Rule):
+    """Émet une alerte critique pour chaque nouveau Form 13D / 13D-A.
+
+    Source : `raw_data` filtré sur `source='sec_edgar', entity_type='sec_filing'`
+    avec `payload.form ∈ {SC 13D, SC 13D/A}`. Un Form 13D signale qu'un
+    investisseur a franchi 5% du capital — typiquement « smart money »
+    activiste ou stratégique. SPEC §7.7 : alerte critique.
+
+    Dedupe : par `accession_number` (clé SEC unique globale).
+    """
+
+    name = "form_13d"
+    severity = "critical"
+    source_name = "sec_edgar"
+    entity_type = "sec_filing"
+    forms: tuple[str, ...] = ("SC 13D", "SC 13D/A")
+
+    def __init__(
+        self,
+        *,
+        lookback_days: int = DEFAULT_FORM_13D_LOOKBACK_DAYS,
+    ) -> None:
+        if lookback_days <= 0:
+            raise ValueError("lookback_days doit être strictement positif")
+        self._lookback_days = int(lookback_days)
+
+    def evaluate(self, as_of: datetime) -> list[AlertCandidate]:
+        since = as_of - timedelta(days=self._lookback_days)
+        stmt = (
+            select(RawData.payload_json, RawData.content_at)
+            .where(RawData.source == self.source_name)
+            .where(RawData.entity_type == self.entity_type)
+            .where(RawData.content_at >= since)
+            .where(RawData.content_at <= as_of)
+            .order_by(RawData.content_at.asc())
+        )
+        with session_scope() as session:
+            rows = session.execute(stmt).all()
+
+        out: list[AlertCandidate] = []
+        for payload_json, content_at in rows:
+            try:
+                payload = _json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            form = payload.get("form")
+            if form not in self.forms:
+                continue
+            accession = payload.get("accession")
+            if not accession:
+                continue
+            ticker = payload.get("ticker")
+            company = payload.get("company_name") or ticker or "—"
+            msg = (
+                f"Form {form} sur {company} ({ticker or '—'}) "
+                f"déposé le {content_at.date().isoformat()}. "
+                f"Franchissement >5% du capital — signal smart money."
+            )
+            out.append(AlertCandidate(
+                rule_name=self.name,
+                severity=self.severity,
+                message=msg,
+                dedupe_key=f"13d:{accession}",
+                asset_type="stock",
+                asset_id=ticker,
+                data={
+                    "accession": str(accession),
+                    "form": form,
+                    "filing_date": content_at.date().isoformat(),
+                    "company_name": company,
+                },
+            ))
+        return out
+
+
+class BuybackMentionRule(Rule):
+    """Émet une alerte warning quand une news mentionne un buyback.
+
+    Limitations v1
+    --------------
+    SPEC §7.7 demande un seuil ">3% du flottant" — l'extraction
+    quantitative depuis le texte d'un article nécessiterait soit un
+    parser NLP dédié, soit un LLM. v1 : on alerte sur **toute mention**
+    de buyback associée à un ticker watchlist. Le tri quantitatif viendra
+    avec la couche NLP (Phase 6 ML).
+
+    Sources : `raw_data` filtré sur `source='newsapi'`. Match sur les
+    keywords dans `title + description` ; le ticker est rapproché via
+    le nom de société (`company_name`) ou ticker direct.
+
+    Dedupe : par URL hash (déjà clé d'idempotence côté collecteur).
+    """
+
+    name = "buyback_mention"
+    severity = "warning"
+    source_name = "newsapi"
+    entity_type = "article"
+
+    def __init__(
+        self,
+        *,
+        lookback_days: int = DEFAULT_BUYBACK_LOOKBACK_DAYS,
+        keywords: tuple[str, ...] = DEFAULT_BUYBACK_KEYWORDS,
+        ticker_to_company: dict[str, str] | None = None,
+    ) -> None:
+        if lookback_days <= 0:
+            raise ValueError("lookback_days doit être strictement positif")
+        if not keywords:
+            raise ValueError("keywords ne peut pas être vide")
+        self._lookback_days = int(lookback_days)
+        self._keywords = tuple(k.lower() for k in keywords)
+        # Mapping ticker → nom company résolu côté watchlist (lazy import
+        # pour éviter la dépendance circulaire en tests).
+        if ticker_to_company is None:
+            from config.watchlists import STOCK_WATCHLIST
+            self._tickers = {
+                w["ticker"]: w["name"] for w in STOCK_WATCHLIST
+            }
+        else:
+            self._tickers = dict(ticker_to_company)
+
+    def evaluate(self, as_of: datetime) -> list[AlertCandidate]:
+        since = as_of - timedelta(days=self._lookback_days)
+        stmt = (
+            select(RawData.payload_json, RawData.content_at, RawData.entity_id)
+            .where(RawData.source == self.source_name)
+            .where(RawData.content_at >= since)
+            .where(RawData.content_at <= as_of)
+            .order_by(RawData.content_at.asc())
+        )
+        with session_scope() as session:
+            rows = session.execute(stmt).all()
+
+        out: list[AlertCandidate] = []
+        for payload_json, content_at, entity_id in rows:
+            try:
+                payload = _json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            text = " ".join([
+                str(payload.get("title") or ""),
+                str(payload.get("description") or ""),
+            ]).lower()
+            if not any(kw in text for kw in self._keywords):
+                continue
+            matched_ticker = self._match_ticker(text)
+            if matched_ticker is None:
+                continue
+            url = payload.get("url") or entity_id
+            title = (payload.get("title") or "")[:120]
+            msg = (
+                f"Mention de buyback sur **{matched_ticker}** "
+                f"({content_at.date().isoformat()}) — \"{title}\""
+            )
+            out.append(AlertCandidate(
+                rule_name=self.name,
+                severity=self.severity,
+                message=msg,
+                # Une alerte par article (URL stable) + ticker.
+                dedupe_key=f"buyback:{matched_ticker}:{entity_id}",
+                asset_type="stock",
+                asset_id=matched_ticker,
+                data={
+                    "url": url,
+                    "title": title,
+                    "matched_ticker": matched_ticker,
+                    "published_at": content_at.date().isoformat(),
+                },
+            ))
+        return out
+
+    def _match_ticker(self, text_lower: str) -> str | None:
+        """Renvoie le 1er ticker watchlist mentionné, sinon None.
+
+        Stratégie : on essaie d'abord le nom de société (plus discriminant
+        que le ticker court qui pourrait collisionner avec d'autres mots :
+        "S" pour SentinelOne par exemple). Sinon on retombe sur le ticker.
+        """
+        # Pass 1 : noms de sociétés.
+        for ticker, name in self._tickers.items():
+            if name and name.lower() in text_lower:
+                return ticker
+        # Pass 2 : tickers en majuscules entourés de séparateurs.
+        # On reconstruit `text` original-cased via le payload — ici on
+        # cherche en lower, mais on requiert un délimiteur pour réduire
+        # les faux positifs (ex : `s` pluriel).
+        import re
+        for ticker in self._tickers:
+            if len(ticker) < 3:
+                continue   # tickers courts (S, F) trop ambigus en text-search
+            pattern = rf"(?:^|[\s\(\[\$]){re.escape(ticker.lower())}(?:$|[\s\)\],\.\:])"
+            if re.search(pattern, text_lower):
+                return ticker
+        return None
+
+
+#: Règles activées par défaut dans `AlertsEngine`.
 DEFAULT_RULES: list[Rule] = [
     NewThesisRule(),
     EvaluationVerdictRule(),
@@ -603,6 +810,8 @@ DEFAULT_RULES: list[Rule] = [
     PDUFANearRule(),
     LargeGovContractRule(),
     CitationVelocityRule(),
+    Form13DRule(),
+    BuybackMentionRule(),
 ]
 
 
@@ -615,6 +824,8 @@ __all__ = [
     "PDUFANearRule",
     "LargeGovContractRule",
     "CitationVelocityRule",
+    "Form13DRule",
+    "BuybackMentionRule",
     "DEFAULT_RULES",
     "DEFAULT_NEW_THESIS_SCORE",
     "DEFAULT_VERDICT_STATUSES",
@@ -626,4 +837,7 @@ __all__ = [
     "DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS",
     "DEFAULT_CITATION_VELOCITY_DELTA",
     "DEFAULT_CITATION_VELOCITY_WINDOW_DAYS",
+    "DEFAULT_FORM_13D_LOOKBACK_DAYS",
+    "DEFAULT_BUYBACK_LOOKBACK_DAYS",
+    "DEFAULT_BUYBACK_KEYWORDS",
 ]

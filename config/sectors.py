@@ -72,6 +72,20 @@ SECTORS: list[SectorDefinition] = [
         "keywords": ["satellite", "launcher", "orbit", "constellation"],
         "arxiv_categories": ["astro-ph.IM", "physics.space-ph"],
     },
+    {
+        "id": "defense",
+        "name": "Défense",
+        "category": "deep_tech",
+        "keywords": ["defense", "missile", "fighter jet", "naval"],
+        "arxiv_categories": [],
+    },
+    {
+        "id": "semiconductors",
+        "name": "Semi-conducteurs",
+        "category": "deep_tech",
+        "keywords": ["semiconductor", "lithography", "wafer", "fab"],
+        "arxiv_categories": [],
+    },
 ]
 
 
