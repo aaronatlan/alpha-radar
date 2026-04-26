@@ -45,7 +45,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["config", "collectors", "memory", "scheduler", "features", "scoring", "dashboard", "thesis", "alerts"]
+packages = ["config", "collectors", "memory", "scheduler", "features", "scoring", "dashboard", "thesis", "alerts", "backtesting"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
