@@ -6,11 +6,13 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from memory.database import Feature, session_scope
+from memory.database import Feature, RawData, session_scope
 from scoring.stock_scorer import (
     StockScorer,
+    _amount_to_score,
     _momentum_to_score,
     _rsi_to_score,
+    _trial_count_to_score,
     _volume_to_score,
 )
 
@@ -247,3 +249,281 @@ def test_v3_skips_sentiment_when_absent(tmp_db):
     scorer = StockScorer(tickers=["NVDA"], model_version="v3_mom_sigqual_sent")
     _, meta = scorer.compute("NVDA", as_of)
     assert "sentiment" not in meta["dimensions"]
+
+
+# ---------------------------------------------- pharma_pipeline mappings
+
+
+@pytest.mark.parametrize(
+    "n,expected",
+    [(0, 0.0), (1, 20.0), (5, 50.0), (20, 80.0), (50, 100.0), (100, 100.0)],
+)
+def test_trial_count_mapping(n, expected):
+    assert _trial_count_to_score(n) == pytest.approx(expected)
+
+
+# ---------------------------------------------- amount_to_score (gov)
+
+
+@pytest.mark.parametrize(
+    "amount,expected",
+    [
+        (0.0, 0.0),
+        (10_000_000.0, 20.0),
+        (100_000_000.0, 50.0),
+        (1_000_000_000.0, 80.0),
+        (10_000_000_000.0, 100.0),
+        (1e12, 100.0),
+    ],
+)
+def test_amount_to_score_paliers(amount, expected):
+    assert _amount_to_score(amount) == pytest.approx(expected, rel=1e-6)
+
+
+def test_amount_to_score_below_first_palier_is_linear():
+    # $1M = 1/10 du premier palier ($10M) → 1/10 * 20 = 2.0
+    assert _amount_to_score(1_000_000.0) == pytest.approx(2.0, rel=1e-6)
+
+
+# ----------------------------- helpers : seed clinical_trial / fda / contract
+
+
+def _seed_clinical_trial(
+    ticker: str,
+    *,
+    nct_id: str = "NCT01",
+    status: str = "RECRUITING",
+    phase: str = "PHASE2",
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "nct_id": nct_id,
+        "ticker": ticker,
+        "overall_status": status,
+        "phase": phase,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="clinicaltrials",
+            entity_type="clinical_trial",
+            entity_id=nct_id,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{nct_id}-{phase}-{status}",
+        ))
+
+
+def _seed_fda_approval(
+    ticker: str,
+    *,
+    app_number: str = "BLA1",
+    sub_number: str = "1",
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "ticker": ticker,
+        "application_number": app_number,
+        "submission_number": sub_number,
+        "submission_status": "AP",
+    }
+    eid = f"{app_number}-{sub_number}"
+    with session_scope() as s:
+        s.add(RawData(
+            source="fda",
+            entity_type="fda_approval",
+            entity_id=eid,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{eid}",
+        ))
+
+
+def _seed_gov_contract(
+    ticker: str,
+    *,
+    award_id: str = "A1",
+    amount: float = 100_000_000.0,
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "ticker": ticker,
+        "award_id": award_id,
+        "award_amount": amount,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="usaspending",
+            entity_type="gov_contract",
+            entity_id=award_id,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{award_id}",
+        ))
+
+
+# ----------------------------------------- pharma_pipeline dimension
+
+
+def test_pharma_pipeline_returns_none_without_data(tmp_db):
+    """Sans trial ni approval → dimension absente."""
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    _seed_feature("rsi_14", "MRNA", 60.0, datetime(2026, 4, 20))
+    _, meta = scorer.compute("MRNA", datetime(2026, 4, 25))
+    assert "pharma_pipeline" not in meta["dimensions"]
+
+
+def test_pharma_pipeline_counts_active_trials_and_phase(tmp_db):
+    _seed_clinical_trial("MRNA", nct_id="NCT01", status="RECRUITING", phase="PHASE2")
+    _seed_clinical_trial("MRNA", nct_id="NCT02", status="ACTIVE_NOT_RECRUITING",
+                         phase="PHASE3")
+    _seed_clinical_trial("MRNA", nct_id="NCT03", status="COMPLETED", phase="PHASE3")
+
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    _, meta = scorer.compute("MRNA", datetime(2026, 4, 25))
+    assert "pharma_pipeline" in meta["dimensions"]
+    detail = meta["details"]["pharma_pipeline"]
+    # 2 actifs (RECRUITING + ACTIVE) — COMPLETED ne compte pas.
+    assert detail["inputs"]["n_active_trials_365d"] == 2
+    # Phase la plus avancée = PHASE3 = 75.
+    assert detail["inputs"]["phase_score"] == 75.0
+
+
+def test_pharma_pipeline_fda_bonus_applied(tmp_db):
+    _seed_clinical_trial("MRNA", phase="PHASE3", status="RECRUITING")
+    _seed_fda_approval("MRNA")
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    score, meta = scorer.compute("MRNA", datetime(2026, 4, 25))
+    detail = meta["details"]["pharma_pipeline"]
+    # Score = (n=20 + phase=75) / 2 + 20 (bonus) = 47.5 + 20 = 67.5
+    assert detail["inputs"]["fda_approvals_365d"] == 1
+    assert meta["dimensions"]["pharma_pipeline"] == pytest.approx(67.5, rel=1e-6)
+
+
+def test_pharma_pipeline_score_capped_at_100(tmp_db):
+    """50 trials actifs (n_score=100) + phase 4 (=85) + bonus 20 → cap à 100."""
+    for i in range(50):
+        _seed_clinical_trial(
+            "MRNA", nct_id=f"NCT{i:03d}", status="RECRUITING", phase="PHASE4",
+        )
+    _seed_fda_approval("MRNA")
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    _, meta = scorer.compute("MRNA", datetime(2026, 4, 25))
+    assert meta["dimensions"]["pharma_pipeline"] == 100.0
+
+
+def test_pharma_pipeline_filters_by_ticker(tmp_db):
+    """Trial sur MRNA ne contribue pas au score CRSP."""
+    _seed_clinical_trial("MRNA", phase="PHASE3", status="RECRUITING")
+    _seed_feature("rsi_14", "CRSP", 60.0, datetime(2026, 4, 20))   # pour avoir un score
+    scorer = StockScorer(tickers=["CRSP"], model_version="v4_sectoral")
+    _, meta = scorer.compute("CRSP", datetime(2026, 4, 25))
+    assert "pharma_pipeline" not in meta["dimensions"]
+
+
+def test_pharma_pipeline_pit_filters_future_trial(tmp_db):
+    """Un trial avec content_at > as_of est ignoré."""
+    _seed_clinical_trial(
+        "MRNA", phase="PHASE3", status="RECRUITING",
+        content_at=datetime(2026, 6, 1),
+    )
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    _, meta = scorer.compute("MRNA", datetime(2026, 4, 25)) or (0.0, {"dimensions": {}})
+    assert "pharma_pipeline" not in (meta.get("dimensions") or {})
+
+
+# ----------------------------------------- gov_contracts dimension
+
+
+def test_gov_contracts_returns_none_without_data(tmp_db):
+    _seed_feature("rsi_14", "LMT", 60.0, datetime(2026, 4, 20))
+    scorer = StockScorer(tickers=["LMT"], model_version="v4_sectoral")
+    _, meta = scorer.compute("LMT", datetime(2026, 4, 25))
+    assert "gov_contracts" not in meta["dimensions"]
+
+
+def test_gov_contracts_aggregates_amounts(tmp_db):
+    _seed_gov_contract("LMT", award_id="A1", amount=50_000_000.0)
+    _seed_gov_contract("LMT", award_id="A2", amount=50_000_000.0)
+    scorer = StockScorer(tickers=["LMT"], model_version="v4_sectoral")
+    _, meta = scorer.compute("LMT", datetime(2026, 4, 25))
+    detail = meta["details"]["gov_contracts"]
+    assert detail["inputs"]["n_contracts_365d"] == 2
+    assert detail["inputs"]["total_amount_usd"] == pytest.approx(100_000_000.0)
+    # $100M = palier 50.
+    assert meta["dimensions"]["gov_contracts"] == pytest.approx(50.0, rel=1e-6)
+
+
+def test_gov_contracts_filters_by_ticker(tmp_db):
+    _seed_gov_contract("LMT", amount=500_000_000.0)
+    _seed_feature("rsi_14", "RKLB", 60.0, datetime(2026, 4, 20))
+    scorer = StockScorer(tickers=["RKLB"], model_version="v4_sectoral")
+    _, meta = scorer.compute("RKLB", datetime(2026, 4, 25))
+    assert "gov_contracts" not in meta["dimensions"]
+
+
+def test_gov_contracts_skips_amount_none(tmp_db):
+    """Un contrat sans award_amount n'est pas comptabilisé."""
+    payload = {
+        "ticker": "LMT", "award_id": "A1", "award_amount": None,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="usaspending", entity_type="gov_contract",
+            entity_id="A1",
+            fetched_at=datetime(2026, 4, 20),
+            content_at=datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash="h-A1-none",
+        ))
+    # Seed RSI pour que le scorer ait au moins une dimension à retourner.
+    _seed_feature("rsi_14", "LMT", 60.0, datetime(2026, 4, 20))
+    scorer = StockScorer(tickers=["LMT"], model_version="v4_sectoral")
+    _, meta = scorer.compute("LMT", datetime(2026, 4, 25))
+    assert "gov_contracts" not in meta["dimensions"]
+
+
+# ----------------------------------------- v4_sectoral end-to-end
+
+
+def test_v4_combines_all_available_dimensions(tmp_db):
+    """v4_sectoral combine les dimensions disponibles avec renormalisation."""
+    as_of = datetime(2026, 4, 25)
+    ts = as_of - timedelta(hours=1)
+    # Momentum (RSI 60 → 100), signal_quality (heat 80), pas de sentiment,
+    # pas de pharma, pas de gov.
+    _seed_feature("rsi_14", "NVDA", 60.0, ts)
+    _seed_feature("sector_heat_score", "ai_ml", 80.0, ts, target_type="sector")
+
+    scorer = StockScorer(tickers=["NVDA"], model_version="v4_sectoral")
+    score, meta = scorer.compute("NVDA", as_of)
+    assert set(meta["dimensions"].keys()) == {"momentum", "signal_quality"}
+    # Renormalisé sur 2 dimensions (momentum 0.30 + signal_quality 0.20 = 0.50).
+    # → score = (0.30*100 + 0.20*80) / 0.50 = (30 + 16) / 0.5 = 92.0
+    assert score == pytest.approx(92.0, rel=1e-6)
+
+
+def test_v4_includes_pharma_for_biotech(tmp_db):
+    """Sur un ticker biotech, pharma_pipeline contribue au score."""
+    as_of = datetime(2026, 4, 25)
+    ts = as_of - timedelta(hours=1)
+    _seed_feature("rsi_14", "MRNA", 60.0, ts)
+    _seed_clinical_trial("MRNA", phase="PHASE3", status="RECRUITING")
+
+    scorer = StockScorer(tickers=["MRNA"], model_version="v4_sectoral")
+    _, meta = scorer.compute("MRNA", as_of)
+    assert "momentum" in meta["dimensions"]
+    assert "pharma_pipeline" in meta["dimensions"]
+
+
+def test_v4_includes_gov_for_defense(tmp_db):
+    as_of = datetime(2026, 4, 25)
+    ts = as_of - timedelta(hours=1)
+    _seed_feature("rsi_14", "LMT", 60.0, ts)
+    _seed_gov_contract("LMT", amount=500_000_000.0)
+
+    scorer = StockScorer(tickers=["LMT"], model_version="v4_sectoral")
+    _, meta = scorer.compute("LMT", as_of)
+    assert "gov_contracts" in meta["dimensions"]

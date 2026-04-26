@@ -237,6 +237,223 @@ def _compute_sentiment_dimension(
     }
 
 
+# ----------------------------------------- pharma_pipeline dimension
+
+
+# Bandes de score par phase la plus avancée observée dans les essais.
+_PHASE_SCORE: dict[str, float] = {
+    "EARLY_PHASE1": 15.0,
+    "PHASE1": 25.0,
+    "PHASE1/PHASE2": 35.0,
+    "PHASE2": 50.0,
+    "PHASE2/PHASE3": 60.0,
+    "PHASE3": 75.0,
+    "PHASE4": 85.0,
+}
+
+# Phase la plus avancée parmi les statuts "live" — recruiting / active.
+_ACTIVE_TRIAL_STATUSES = {
+    "RECRUITING", "ACTIVE_NOT_RECRUITING", "ENROLLING_BY_INVITATION",
+    "AVAILABLE",
+}
+
+#: Fenêtre de prise en compte des trials / approvals (jours).
+_PHARMA_WINDOW_DAYS = 365
+
+#: Bonus appliqué quand au moins 1 approval FDA AP dans la fenêtre.
+_FDA_APPROVAL_BONUS = 20.0
+
+
+def _trial_count_to_score(n: int) -> float:
+    """Mapping log-like : 0=0, 1=20, 5=50, 20=80, 50+=100."""
+    if n <= 0:
+        return 0.0
+    if n >= 50:
+        return 100.0
+    # Approximation log-pal : interpolation linéaire entre paliers.
+    paliers = [(1, 20.0), (5, 50.0), (20, 80.0), (50, 100.0)]
+    for (n_lo, s_lo), (n_hi, s_hi) in zip(paliers, paliers[1:]):
+        if n <= n_hi:
+            ratio = (n - n_lo) / (n_hi - n_lo) if n_hi > n_lo else 0
+            return s_lo + ratio * (s_hi - s_lo)
+    return 100.0
+
+
+def _compute_pharma_pipeline_dimension(
+    ticker: str, as_of: datetime
+) -> tuple[float, dict[str, Any]] | None:
+    """Sous-score basé sur le pipeline clinique + approvals FDA récents.
+
+    Composantes (lus depuis `raw_data` PIT) :
+      - n essais cliniques avec statut "live" sur 365j → mappé à [0, 100]
+      - phase la plus avancée observée → [15, 85]
+      - bonus +20 si ≥1 approval FDA dans 365j (capped à 100)
+
+    Retourne `None` si aucun trial / approval n'est observable PIT —
+    c'est ce qui fait que les tickers non biotech voient cette dimension
+    renormalisée hors du score.
+    """
+    import json as _json
+
+    start = as_of - timedelta(days=_PHARMA_WINDOW_DAYS)
+    trials_active = 0
+    most_advanced_score = 0.0
+    seen_phase: bool = False
+    fda_approval_count = 0
+
+    with session_scope() as session:
+        # --- Essais cliniques.
+        ct_stmt = (
+            select(RawData.payload_json)
+            .where(RawData.source == "clinicaltrials")
+            .where(RawData.entity_type == "clinical_trial")
+            .where(RawData.content_at >= start)
+            .where(RawData.content_at <= as_of)
+            .where(RawData.fetched_at <= as_of)
+        )
+        for (payload_json,) in session.execute(ct_stmt):
+            try:
+                payload = _json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            status = payload.get("overall_status")
+            if status in _ACTIVE_TRIAL_STATUSES:
+                trials_active += 1
+            phase = payload.get("phase")
+            if phase and phase in _PHASE_SCORE:
+                seen_phase = True
+                most_advanced_score = max(
+                    most_advanced_score, _PHASE_SCORE[phase],
+                )
+
+        # --- Approvals FDA (status=AP).
+        fda_stmt = (
+            select(RawData.payload_json)
+            .where(RawData.source == "fda")
+            .where(RawData.entity_type == "fda_approval")
+            .where(RawData.content_at >= start)
+            .where(RawData.content_at <= as_of)
+            .where(RawData.fetched_at <= as_of)
+        )
+        for (payload_json,) in session.execute(fda_stmt):
+            try:
+                payload = _json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            if payload.get("submission_status") == "AP":
+                fda_approval_count += 1
+
+    if trials_active == 0 and not seen_phase and fda_approval_count == 0:
+        return None
+
+    n_score = _trial_count_to_score(trials_active)
+    # 50/50 entre n essais actifs et phase la plus avancée si les deux
+    # existent ; sinon, la composante manquante est ignorée.
+    parts: dict[str, float] = {"n_trials": n_score}
+    if seen_phase:
+        parts["max_phase"] = most_advanced_score
+    base = sum(parts.values()) / len(parts)
+    score = min(100.0, base + (_FDA_APPROVAL_BONUS if fda_approval_count else 0))
+
+    return score, {
+        "subscores": parts,
+        "inputs": {
+            "n_active_trials_365d": trials_active,
+            "fda_approvals_365d": fda_approval_count,
+            "phase_score": most_advanced_score if seen_phase else None,
+        },
+    }
+
+
+# ----------------------------------------- gov_contracts dimension
+
+
+#: Fenêtre de comptabilisation des contrats gouv (jours).
+_GOV_WINDOW_DAYS = 365
+
+
+def _amount_to_score(amount_usd: float) -> float:
+    """Échelle log : $0=0, $10M=20, $100M=50, $1B=80, $10B+=100."""
+    if amount_usd <= 0:
+        return 0.0
+    paliers = [
+        (10_000_000.0, 20.0),
+        (100_000_000.0, 50.0),
+        (1_000_000_000.0, 80.0),
+        (10_000_000_000.0, 100.0),
+    ]
+    if amount_usd >= paliers[-1][0]:
+        return 100.0
+    if amount_usd <= paliers[0][0]:
+        # En-dessous du 1er palier, linéaire 0 → 20.
+        return 20.0 * (amount_usd / paliers[0][0])
+    for (a_lo, s_lo), (a_hi, s_hi) in zip(paliers, paliers[1:]):
+        if amount_usd <= a_hi:
+            # Interpolation log-linéaire dans la bande.
+            import math
+            t = (math.log(amount_usd) - math.log(a_lo)) / (
+                math.log(a_hi) - math.log(a_lo)
+            )
+            return s_lo + t * (s_hi - s_lo)
+    return 100.0
+
+
+def _compute_gov_contracts_dimension(
+    ticker: str, as_of: datetime
+) -> tuple[float, dict[str, Any]] | None:
+    """Sous-score basé sur les contrats gouvernementaux US reçus.
+
+    Lit `raw_data` filtré sur `source='usaspending', entity_type='gov_contract'`
+    pour le ticker, agrège les `award_amount` sur la fenêtre. Si aucun
+    contrat n'est observable, retourne `None`.
+    """
+    import json as _json
+
+    start = as_of - timedelta(days=_GOV_WINDOW_DAYS)
+    total_amount = 0.0
+    n_contracts = 0
+    with session_scope() as session:
+        stmt = (
+            select(RawData.payload_json)
+            .where(RawData.source == "usaspending")
+            .where(RawData.entity_type == "gov_contract")
+            .where(RawData.content_at >= start)
+            .where(RawData.content_at <= as_of)
+            .where(RawData.fetched_at <= as_of)
+        )
+        for (payload_json,) in session.execute(stmt):
+            try:
+                payload = _json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            amount = payload.get("award_amount")
+            if amount is None:
+                continue
+            try:
+                total_amount += float(amount)
+                n_contracts += 1
+            except (TypeError, ValueError):
+                continue
+
+    if n_contracts == 0:
+        return None
+
+    score = _amount_to_score(total_amount)
+    return score, {
+        "subscores": {"amount_log": score},
+        "inputs": {
+            "n_contracts_365d": n_contracts,
+            "total_amount_usd": total_amount,
+        },
+    }
+
+
 # --------------------------------------------------------------- scorer
 
 
@@ -280,6 +497,16 @@ class StockScorer(BaseFeature):
             sent = _compute_sentiment_dimension(target_id, as_of)
             if sent is not None:
                 dimensions["sentiment"] = sent
+
+        if "pharma_pipeline" in self._weights:
+            pharma = _compute_pharma_pipeline_dimension(target_id, as_of)
+            if pharma is not None:
+                dimensions["pharma_pipeline"] = pharma
+
+        if "gov_contracts" in self._weights:
+            gov = _compute_gov_contracts_dimension(target_id, as_of)
+            if gov is not None:
+                dimensions["gov_contracts"] = gov
 
         if not dimensions:
             return None

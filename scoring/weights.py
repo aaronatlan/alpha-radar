@@ -45,6 +45,17 @@ STOCK_SCORE_WEIGHTS: dict[str, dict[str, float]] = {
     "v3_mom_sigqual_sent": {
         "momentum": 0.4, "signal_quality": 0.3, "sentiment": 0.3,
     },
+    # Phase 4 Étape 5 : ajout des dimensions sectorielles (pharma_pipeline
+    # pour biotech, gov_contracts pour space/défense). Les tickers hors
+    # secteur retournent None sur ces dimensions → renormalisation
+    # automatique sur les dimensions effectivement disponibles.
+    "v4_sectoral": {
+        "momentum": 0.30,
+        "signal_quality": 0.20,
+        "sentiment": 0.20,
+        "pharma_pipeline": 0.15,
+        "gov_contracts": 0.15,
+    },
 }
 
 
