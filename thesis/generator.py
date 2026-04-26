@@ -26,14 +26,15 @@ poids exacts de l'époque, même si `scoring.weights` évolue plus tard.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, time
+from datetime import date, datetime, timedelta, time
 from typing import Any
 
 from loguru import logger
 from sqlalchemy import select
 
+from config.pdufa_calendar import upcoming_pdufas
 from config.watchlists import STOCK_WATCHLIST, WATCHLIST_TICKERS
-from memory.database import Feature, Thesis, session_scope, utc_now
+from memory.database import Feature, RawData, Thesis, session_scope, utc_now
 from thesis._io import latest_close_at as _latest_entry_price
 
 
@@ -142,6 +143,219 @@ def _make_risks(sector_ids: list[str]) -> list[dict[str, str]]:
     return risks
 
 
+# --------------------------------------------------------- catalyseurs
+
+
+#: Fenêtre par défaut pour la chasse aux catalyseurs récents (jours).
+_CATALYST_RECENT_WINDOW_DAYS = 90
+
+#: Phases considérées comme "tardives" (catalyseur fort si en cours).
+_LATE_PHASES = {"PHASE3", "PHASE2/PHASE3", "PHASE4"}
+
+#: Statuts considérés comme "trial en cours".
+_LATE_TRIAL_ACTIVE = {
+    "RECRUITING", "ACTIVE_NOT_RECRUITING", "ENROLLING_BY_INVITATION",
+}
+
+#: Top N contrats gouv à mentionner dans les catalyseurs défense.
+_TOP_GOV_CONTRACTS = 3
+
+
+def _pdufa_catalysts(ticker: str, as_of: datetime) -> list[dict[str, Any]]:
+    """PDUFAs futures pour ce ticker depuis `pdufa_calendar`."""
+    out: list[dict[str, Any]] = []
+    today = as_of.date()
+    for entry in upcoming_pdufas(today):
+        if entry.get("ticker") != ticker:
+            continue
+        try:
+            d = date.fromisoformat(entry["target_action_date"])
+        except (KeyError, ValueError):
+            continue
+        days_to = (d - today).days
+        drug = entry.get("drug", "n/a")
+        out.append({
+            "type": "pdufa",
+            "date": entry["target_action_date"],
+            "days_to": days_to,
+            "drug": drug,
+            "indication": entry.get("indication"),
+            "description": (
+                f"PDUFA J+{days_to}j sur **{drug}**"
+                + (f" ({entry['indication']})" if entry.get("indication") else "")
+            ),
+            "source": "pdufa_calendar",
+        })
+    return out
+
+
+def _active_late_phase_trials(
+    ticker: str, as_of: datetime, lookback_days: int = 365,
+) -> list[dict[str, Any]]:
+    """Essais Phase 3+ en cours pour ce ticker, observés sur `lookback_days`."""
+    start = as_of - timedelta(days=lookback_days)
+    stmt = (
+        select(RawData.payload_json)
+        .where(RawData.source == "clinicaltrials")
+        .where(RawData.entity_type == "clinical_trial")
+        .where(RawData.content_at >= start)
+        .where(RawData.content_at <= as_of)
+        .where(RawData.fetched_at <= as_of)
+    )
+    seen_nct: set[str] = set()
+    out: list[dict[str, Any]] = []
+    with session_scope() as session:
+        for (payload_json,) in session.execute(stmt):
+            try:
+                payload = json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            phase = payload.get("phase")
+            status = payload.get("overall_status")
+            if phase not in _LATE_PHASES or status not in _LATE_TRIAL_ACTIVE:
+                continue
+            nct_id = payload.get("nct_id")
+            if not nct_id or nct_id in seen_nct:
+                continue
+            seen_nct.add(nct_id)
+            interv = payload.get("interventions") or []
+            drug = interv[0] if interv else "candidat"
+            out.append({
+                "type": "phase3_trial",
+                "nct_id": nct_id,
+                "phase": phase,
+                "status": status,
+                "drug": drug,
+                "completion_date": payload.get("primary_completion_date"),
+                "description": (
+                    f"{phase} en cours sur **{drug}** "
+                    f"(NCT={nct_id}, {status})"
+                ),
+                "source": "clinicaltrials",
+            })
+    return out
+
+
+def _recent_fda_approvals(
+    ticker: str, as_of: datetime, lookback_days: int = _CATALYST_RECENT_WINDOW_DAYS,
+) -> list[dict[str, Any]]:
+    """Approvals FDA AP récents pour ce ticker."""
+    start = as_of - timedelta(days=lookback_days)
+    stmt = (
+        select(RawData.payload_json, RawData.content_at)
+        .where(RawData.source == "fda")
+        .where(RawData.entity_type == "fda_approval")
+        .where(RawData.content_at >= start)
+        .where(RawData.content_at <= as_of)
+        .where(RawData.fetched_at <= as_of)
+        .order_by(RawData.content_at.desc())
+    )
+    out: list[dict[str, Any]] = []
+    with session_scope() as session:
+        for payload_json, content_at in session.execute(stmt):
+            try:
+                payload = json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            if payload.get("submission_status") != "AP":
+                continue
+            brand = payload.get("brand_name") or payload.get("application_number")
+            out.append({
+                "type": "fda_approval",
+                "date": content_at.date().isoformat(),
+                "drug": brand,
+                "application_number": payload.get("application_number"),
+                "description": (
+                    f"Approval FDA récente : **{brand}** ({content_at.date()})"
+                ),
+                "source": "fda",
+            })
+    return out
+
+
+def _recent_large_contracts(
+    ticker: str, as_of: datetime,
+    lookback_days: int = _CATALYST_RECENT_WINDOW_DAYS,
+    top_n: int = _TOP_GOV_CONTRACTS,
+) -> list[dict[str, Any]]:
+    """Top contrats gouv US par montant pour ce ticker, fenêtre `lookback_days`."""
+    start = as_of - timedelta(days=lookback_days)
+    stmt = (
+        select(RawData.payload_json, RawData.content_at)
+        .where(RawData.source == "usaspending")
+        .where(RawData.entity_type == "gov_contract")
+        .where(RawData.content_at >= start)
+        .where(RawData.content_at <= as_of)
+        .where(RawData.fetched_at <= as_of)
+    )
+    rows: list[dict[str, Any]] = []
+    with session_scope() as session:
+        for payload_json, content_at in session.execute(stmt):
+            try:
+                payload = json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("ticker") != ticker:
+                continue
+            amount = payload.get("award_amount")
+            if amount is None:
+                continue
+            rows.append({
+                "type": "gov_contract",
+                "date": content_at.date().isoformat(),
+                "amount_usd": float(amount),
+                "agency": payload.get("awarding_agency"),
+                "description_raw": (payload.get("description") or "").strip(),
+                "award_id": payload.get("award_id"),
+            })
+    rows.sort(key=lambda r: r["amount_usd"], reverse=True)
+    out: list[dict[str, Any]] = []
+    for r in rows[:top_n]:
+        desc_short = r["description_raw"][:80]
+        msg = (
+            f"Contrat ${r['amount_usd'] / 1e6:.1f}M de "
+            f"{r['agency'] or '—'} ({r['date']})"
+            + (f" — {desc_short}" if desc_short else "")
+        )
+        out.append({
+            "type": r["type"],
+            "date": r["date"],
+            "amount_usd": r["amount_usd"],
+            "agency": r["agency"],
+            "award_id": r["award_id"],
+            "description": msg,
+            "source": "usaspending",
+        })
+    return out
+
+
+def _make_catalysts(
+    ticker: str, sectors: list[str], as_of: datetime,
+) -> list[dict[str, Any]]:
+    """Catalyseurs sectoriels datés pour la thèse.
+
+    Les sources sont activées par secteur :
+      - `biotech` → PDUFA calendar + Phase 3 actifs + approvals récents
+      - `space` (et plus tard `defense`) → top contrats gouv récents
+
+    Un ticker multi-secteurs (ex : ai_ml + biotech théorique) cumule.
+    Les sources sans donnée renvoient `[]` silencieusement — la narrative
+    affichera alors le placeholder générique.
+    """
+    catalysts: list[dict[str, Any]] = []
+    if "biotech" in sectors:
+        catalysts.extend(_pdufa_catalysts(ticker, as_of))
+        catalysts.extend(_active_late_phase_trials(ticker, as_of))
+        catalysts.extend(_recent_fda_approvals(ticker, as_of))
+    if "space" in sectors:
+        catalysts.extend(_recent_large_contracts(ticker, as_of))
+    return catalysts
+
+
 def _make_narrative(
     *,
     ticker: str,
@@ -151,6 +365,7 @@ def _make_narrative(
     dimensions: dict[str, float],
     triggers: list[dict[str, Any]],
     risks: list[dict[str, str]],
+    catalysts: list[dict[str, Any]] | None,
     entry_price: float | None,
     horizon_days: int,
 ) -> str:
@@ -164,11 +379,23 @@ def _make_narrative(
         for dim, val in sorted(dimensions.items(), key=lambda kv: -kv[1])
     )
 
-    catalysts_placeholder = (
-        "À ce stade, pas de catalyseur daté de source externe (earnings, "
-        "PDUFA, conférences seront intégrés en Phase 4). "
-        f"Horizon retenu : {horizon_days} jours."
-    )
+    if catalysts:
+        # Tri : PDUFA en premier (le plus actionable), puis trials, puis approvals,
+        # puis contrats. À iso-type, dates les plus proches d'abord.
+        order = {"pdufa": 0, "phase3_trial": 1, "fda_approval": 2, "gov_contract": 3}
+        ordered = sorted(
+            catalysts, key=lambda c: (order.get(c.get("type", ""), 9), c.get("date") or "")
+        )
+        catalysts_section = (
+            "\n".join(f"  - {c['description']}" for c in ordered)
+            + f"\n  - Horizon retenu : {horizon_days} jours."
+        )
+    else:
+        catalysts_section = (
+            "  - Pas de catalyseur daté collecté (PDUFA, contrats, "
+            "approvals — voir Phase 4 pour les secteurs concernés).\n"
+            f"  - Horizon retenu : {horizon_days} jours."
+        )
 
     risks_lines = "\n".join(
         f"  - [{r['category']}] {r['description']}" for r in risks
@@ -194,7 +421,7 @@ def _make_narrative(
         f"Le score composite atteint {score:.1f}/100, tiré par "
         f"{dom_str}. Secteur(s) : {sectors_str}.\n\n"
         f"**Score**\n{dims_lines}\n\n"
-        f"**Catalyseurs**\n{catalysts_placeholder}\n\n"
+        f"**Catalyseurs**\n{catalysts_section}\n\n"
         f"**Risques**\n{risks_lines}\n\n"
         f"**Entrée**\n{entry_str}"
     )
@@ -331,6 +558,7 @@ class ThesisGenerator:
 
         triggers = _make_triggers(dimensions, details)
         risks = _make_risks(sectors)
+        catalysts = _make_catalysts(ticker, sectors, as_of)
         entry_price = _latest_entry_price(ticker, as_of)
         narrative = _make_narrative(
             ticker=ticker,
@@ -340,6 +568,7 @@ class ThesisGenerator:
             dimensions={k: float(v) for k, v in dimensions.items()},
             triggers=triggers,
             risks=risks,
+            catalysts=catalysts,
             entry_price=entry_price,
             horizon_days=self._horizon_days,
         )
@@ -369,7 +598,8 @@ class ThesisGenerator:
                 entry_conditions_json=json.dumps(entry_conditions),
                 triggers_json=json.dumps(triggers, default=str, ensure_ascii=False),
                 risks_json=json.dumps(risks, ensure_ascii=False),
-                catalysts_json=json.dumps([]),  # rempli en Phase 4
+                catalysts_json=json.dumps(catalysts, default=str,
+                                           ensure_ascii=False),
                 narrative=narrative,
                 model_version=model_version,
                 weights_snapshot_json=json.dumps(weights_snapshot),

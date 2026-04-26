@@ -1,4 +1,4 @@
-"""Tests du `ThesisGenerator` (Phase 3 étape 1)."""
+"""Tests du `ThesisGenerator` (Phase 3 étape 1 + Phase 4 étape 6)."""
 from __future__ import annotations
 
 import json
@@ -9,10 +9,15 @@ import pytest
 from memory.database import Feature, RawData, Thesis, session_scope
 from thesis.generator import (
     ThesisGenerator,
+    _active_late_phase_trials,
     _dominant_dimension,
     _latest_entry_price,
+    _make_catalysts,
     _make_recommendation,
     _make_risks,
+    _pdufa_catalysts,
+    _recent_fda_approvals,
+    _recent_large_contracts,
 )
 
 
@@ -264,3 +269,300 @@ def test_run_isolates_per_ticker_errors(tmp_db):
 
     n = ThesisGenerator(tickers=["NVDA", "UNKNOWN"]).run(as_of=as_of)
     assert n == 2  # les deux passent
+
+
+# -------------------------------------------------- Étape 6 : catalyseurs
+
+
+def _seed_clinical_trial(
+    ticker: str,
+    *,
+    nct_id: str = "NCT01",
+    status: str = "RECRUITING",
+    phase: str = "PHASE3",
+    interventions: list[str] | None = None,
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "nct_id": nct_id,
+        "ticker": ticker,
+        "overall_status": status,
+        "phase": phase,
+        "interventions": interventions or ["mRNA-1234"],
+        "primary_completion_date": "2027-12-01",
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="clinicaltrials",
+            entity_type="clinical_trial",
+            entity_id=nct_id,
+            fetched_at=content_at or datetime(2026, 4, 20),
+            content_at=content_at or datetime(2026, 4, 20),
+            payload_json=json.dumps(payload),
+            hash=f"h-{nct_id}-{phase}-{status}",
+        ))
+
+
+def _seed_fda_approval(
+    ticker: str,
+    *,
+    app_number: str = "BLA1",
+    sub_number: str = "1",
+    brand: str = "Spikevax",
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "ticker": ticker,
+        "application_number": app_number,
+        "submission_number": sub_number,
+        "submission_status": "AP",
+        "brand_name": brand,
+    }
+    eid = f"{app_number}-{sub_number}"
+    with session_scope() as s:
+        s.add(RawData(
+            source="fda",
+            entity_type="fda_approval",
+            entity_id=eid,
+            fetched_at=content_at or datetime(2026, 4, 1),
+            content_at=content_at or datetime(2026, 4, 1),
+            payload_json=json.dumps(payload),
+            hash=f"h-{eid}",
+        ))
+
+
+def _seed_gov_contract(
+    ticker: str,
+    *,
+    award_id: str = "A1",
+    amount: float = 250_000_000.0,
+    agency: str = "Department of Defense",
+    description: str = "F-35 lot procurement",
+    content_at: datetime | None = None,
+) -> None:
+    payload = {
+        "ticker": ticker,
+        "award_id": award_id,
+        "award_amount": amount,
+        "awarding_agency": agency,
+        "description": description,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="usaspending",
+            entity_type="gov_contract",
+            entity_id=award_id,
+            fetched_at=content_at or datetime(2026, 4, 1),
+            content_at=content_at or datetime(2026, 4, 1),
+            payload_json=json.dumps(payload),
+            hash=f"h-{award_id}",
+        ))
+
+
+# ---------------- _pdufa_catalysts
+
+
+def test_pdufa_catalysts_returns_only_ticker_match(monkeypatch):
+    import thesis.generator as gen_mod
+    monkeypatch.setattr(gen_mod, "upcoming_pdufas", lambda d: [
+        {"ticker": "MRNA", "target_action_date": "2026-05-10",
+         "drug": "mRNA-1234", "indication": "cancer"},
+        {"ticker": "CRSP", "target_action_date": "2026-06-01", "drug": "X"},
+    ])
+    out = _pdufa_catalysts("MRNA", datetime(2026, 4, 25))
+    assert len(out) == 1
+    c = out[0]
+    assert c["type"] == "pdufa"
+    assert c["days_to"] == 15
+    assert c["drug"] == "mRNA-1234"
+    assert "PDUFA" in c["description"]
+
+
+def test_pdufa_catalysts_handles_invalid_date(monkeypatch):
+    import thesis.generator as gen_mod
+    monkeypatch.setattr(gen_mod, "upcoming_pdufas", lambda d: [
+        {"ticker": "MRNA", "target_action_date": "garbage", "drug": "X"},
+    ])
+    assert _pdufa_catalysts("MRNA", datetime(2026, 4, 25)) == []
+
+
+# ---------------- _active_late_phase_trials
+
+
+def test_active_late_phase_trials_filters_phase_and_status(tmp_db):
+    _seed_clinical_trial("MRNA", nct_id="NCT01", phase="PHASE3", status="RECRUITING")
+    _seed_clinical_trial("MRNA", nct_id="NCT02", phase="PHASE2", status="RECRUITING")
+    _seed_clinical_trial("MRNA", nct_id="NCT03", phase="PHASE3", status="COMPLETED")
+    out = _active_late_phase_trials("MRNA", datetime(2026, 4, 25))
+    assert len(out) == 1
+    assert out[0]["nct_id"] == "NCT01"
+    assert out[0]["phase"] == "PHASE3"
+
+
+def test_active_late_phase_trials_dedupes_by_nct(tmp_db):
+    """Si plusieurs snapshots du même NCT (statut différent → hash différent),
+    on n'en retient qu'un dans la sortie."""
+    _seed_clinical_trial("MRNA", nct_id="NCT_A", phase="PHASE3",
+                         status="RECRUITING",
+                         content_at=datetime(2026, 4, 10))
+    _seed_clinical_trial("MRNA", nct_id="NCT_A", phase="PHASE3",
+                         status="ACTIVE_NOT_RECRUITING",
+                         content_at=datetime(2026, 4, 20))
+    out = _active_late_phase_trials("MRNA", datetime(2026, 4, 25))
+    assert len(out) == 1
+
+
+def test_active_late_phase_trials_filters_by_ticker(tmp_db):
+    _seed_clinical_trial("MRNA", nct_id="NCT01", phase="PHASE3")
+    out = _active_late_phase_trials("CRSP", datetime(2026, 4, 25))
+    assert out == []
+
+
+# ---------------- _recent_fda_approvals
+
+
+def test_recent_fda_approvals_returns_recent(tmp_db):
+    _seed_fda_approval("MRNA", brand="Spikevax",
+                       content_at=datetime(2026, 3, 15))
+    out = _recent_fda_approvals("MRNA", datetime(2026, 4, 25),
+                                 lookback_days=90)
+    assert len(out) == 1
+    assert out[0]["drug"] == "Spikevax"
+
+
+def test_recent_fda_approvals_skips_old(tmp_db):
+    _seed_fda_approval("MRNA", content_at=datetime(2025, 1, 1))
+    out = _recent_fda_approvals("MRNA", datetime(2026, 4, 25),
+                                 lookback_days=90)
+    assert out == []
+
+
+# ---------------- _recent_large_contracts
+
+
+def test_recent_large_contracts_sorts_by_amount(tmp_db):
+    _seed_gov_contract("LMT", award_id="A1", amount=100_000_000.0)
+    _seed_gov_contract("LMT", award_id="A2", amount=500_000_000.0)
+    _seed_gov_contract("LMT", award_id="A3", amount=50_000_000.0)
+    out = _recent_large_contracts("LMT", datetime(2026, 4, 25))
+    assert len(out) == 3
+    amounts = [c["amount_usd"] for c in out]
+    assert amounts == sorted(amounts, reverse=True)
+    assert amounts[0] == 500_000_000.0
+
+
+def test_recent_large_contracts_top_n(tmp_db):
+    """Limite à top_n=3 par défaut."""
+    for i in range(5):
+        _seed_gov_contract(
+            "LMT", award_id=f"A{i}", amount=100_000_000.0 * (i + 1),
+        )
+    out = _recent_large_contracts("LMT", datetime(2026, 4, 25))
+    assert len(out) == 3
+
+
+def test_recent_large_contracts_filters_by_ticker(tmp_db):
+    _seed_gov_contract("LMT", amount=200_000_000.0)
+    assert _recent_large_contracts("RKLB", datetime(2026, 4, 25)) == []
+
+
+# ---------------- _make_catalysts (orchestrateur)
+
+
+def test_make_catalysts_biotech_aggregates_sources(tmp_db, monkeypatch):
+    import thesis.generator as gen_mod
+    monkeypatch.setattr(gen_mod, "upcoming_pdufas", lambda d: [
+        {"ticker": "MRNA", "target_action_date": "2026-05-10",
+         "drug": "mRNA-1234"},
+    ])
+    _seed_clinical_trial("MRNA", nct_id="NCT01", phase="PHASE3",
+                         status="RECRUITING")
+    _seed_fda_approval("MRNA", content_at=datetime(2026, 3, 1))
+    out = _make_catalysts("MRNA", ["biotech"], datetime(2026, 4, 25))
+    types = {c["type"] for c in out}
+    assert types == {"pdufa", "phase3_trial", "fda_approval"}
+
+
+def test_make_catalysts_space_uses_gov_contracts(tmp_db):
+    _seed_gov_contract("LMT", amount=300_000_000.0,
+                        content_at=datetime(2026, 4, 1))
+    out = _make_catalysts("LMT", ["space"], datetime(2026, 4, 25))
+    assert len(out) == 1
+    assert out[0]["type"] == "gov_contract"
+
+
+def test_make_catalysts_returns_empty_for_irrelevant_sectors(tmp_db):
+    """Un ticker AI/ML n'a aucun catalyseur sectoriel collecté."""
+    out = _make_catalysts("NVDA", ["ai_ml"], datetime(2026, 4, 25))
+    assert out == []
+
+
+def test_make_catalysts_multi_sector_combines(tmp_db, monkeypatch):
+    """Un ticker multi-secteurs cumule les catalyseurs des sources actives."""
+    import thesis.generator as gen_mod
+    monkeypatch.setattr(gen_mod, "upcoming_pdufas", lambda d: [
+        {"ticker": "X", "target_action_date": "2026-05-10", "drug": "Y"},
+    ])
+    _seed_gov_contract("X", amount=200_000_000.0)
+    out = _make_catalysts("X", ["biotech", "space"], datetime(2026, 4, 25))
+    types = {c["type"] for c in out}
+    assert "pdufa" in types
+    assert "gov_contract" in types
+
+
+# ---------------- bout-en-bout : thèse avec catalyseurs
+
+
+def test_run_writes_catalysts_into_thesis_for_biotech(tmp_db, monkeypatch):
+    """Une thèse biotech doit refléter les PDUFA + Phase 3 dans
+    `catalysts_json` et la narrative."""
+    as_of = datetime(2026, 4, 20)
+    _seed_score("MRNA", 80.0, as_of - timedelta(hours=1))
+
+    import thesis.generator as gen_mod
+    monkeypatch.setattr(gen_mod, "upcoming_pdufas", lambda d: [
+        {"ticker": "MRNA", "target_action_date": "2026-05-10",
+         "drug": "mRNA-1234", "indication": "cancer du poumon"},
+    ])
+    _seed_clinical_trial("MRNA", nct_id="NCT_X", phase="PHASE3",
+                         status="RECRUITING")
+
+    n = ThesisGenerator(tickers=["MRNA"]).run(as_of=as_of)
+    assert n == 1
+    with session_scope() as s:
+        th = s.query(Thesis).one()
+        cats = json.loads(th.catalysts_json)
+        types = {c["type"] for c in cats}
+        assert "pdufa" in types
+        assert "phase3_trial" in types
+        # La narrative inclut le détail PDUFA.
+        assert "PDUFA" in th.narrative
+        assert "mRNA-1234" in th.narrative
+
+
+def test_run_writes_gov_contracts_into_thesis_for_space(tmp_db):
+    as_of = datetime(2026, 4, 20)
+    _seed_score("LMT", 80.0, as_of - timedelta(hours=1))
+    _seed_gov_contract("LMT", amount=500_000_000.0,
+                        content_at=as_of - timedelta(days=10))
+
+    n = ThesisGenerator(tickers=["LMT"]).run(as_of=as_of)
+    assert n == 1
+    with session_scope() as s:
+        th = s.query(Thesis).one()
+        cats = json.loads(th.catalysts_json)
+        assert any(c["type"] == "gov_contract" for c in cats)
+        # Mention du montant en M$ dans la narrative.
+        assert "$500.0M" in th.narrative or "500.0M" in th.narrative
+
+
+def test_run_thesis_without_catalysts_uses_placeholder(tmp_db):
+    """Aucun catalyseur sectoriel collecté → placeholder dans la narrative."""
+    as_of = datetime(2026, 4, 20)
+    _seed_score("NVDA", 90.0, as_of - timedelta(hours=1))
+    n = ThesisGenerator(tickers=["NVDA"]).run(as_of=as_of)
+    assert n == 1
+    with session_scope() as s:
+        th = s.query(Thesis).one()
+        assert json.loads(th.catalysts_json) == []
+        assert "Pas de catalyseur" in th.narrative
