@@ -14,6 +14,7 @@ Cadences choisies (heure Europe/Paris) :
   Collectes
   ---------
   06:00 quotidien  — arXiv (48 h)
+  06:15 quotidien  — Semantic Scholar (snapshot top papers par secteur)
   06:30 quotidien  — ClinicalTrials.gov (fenêtre 7 j sur lastUpdatePostDate)
   06:45 quotidien  — FDA approvals (fenêtre 30 j sur submission_status_date)
   07:15 quotidien  — USASpending contrats gouv (fenêtre 14 j sur action_date)
@@ -50,6 +51,7 @@ from collectors.arxiv_collector import ArxivCollector
 from collectors.clinicaltrials_collector import ClinicalTrialsCollector
 from collectors.coingecko_collector import CoinGeckoCollector
 from collectors.fda_collector import FDACollector
+from collectors.semantic_scholar_collector import SemanticScholarCollector
 from collectors.usaspending_collector import USASpendingCollector
 from collectors.github_collector import GitHubCollector
 from collectors.news_collector import NewsAPICollector
@@ -87,6 +89,12 @@ def _run_collector(label: str, build, days: int) -> None:
 
 def run_arxiv_job() -> None:
     _run_collector("arxiv", ArxivCollector, days=2)
+
+
+def run_semantic_scholar_job() -> None:
+    # Le collecteur ignore since/until et filtre côté API sur publicationDate
+    # (fenêtre `recent_window_days` interne). On passe 1 j formel.
+    _run_collector("semantic_scholar", SemanticScholarCollector, days=1)
 
 
 def run_clinicaltrials_job() -> None:
@@ -213,6 +221,13 @@ def build_scheduler() -> BlockingScheduler:
         trigger=CronTrigger(hour=6, minute=0),
         id="arxiv_daily",
         name="arXiv daily collection",
+        replace_existing=True,
+    )
+    sched.add_job(
+        run_semantic_scholar_job,
+        trigger=CronTrigger(hour=6, minute=15),
+        id="semantic_scholar_daily",
+        name="Semantic Scholar papers snapshot",
         replace_existing=True,
     )
     sched.add_job(

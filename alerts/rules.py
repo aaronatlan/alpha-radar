@@ -64,6 +64,10 @@ DEFAULT_PDUFA_SCORE_THRESHOLD = 70.0
 DEFAULT_LARGE_CONTRACT_THRESHOLD = 100_000_000.0
 DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS = 7
 
+#: Seuils citation velocity (SPEC §7.7) : +100 citations en 7 jours.
+DEFAULT_CITATION_VELOCITY_DELTA = 100
+DEFAULT_CITATION_VELOCITY_WINDOW_DAYS = 7
+
 
 # ----------------------------------------------------------------- types
 
@@ -482,14 +486,123 @@ class LargeGovContractRule(Rule):
         return out
 
 
+class CitationVelocityRule(Rule):
+    """Émet une alerte warning quand un paper accumule trop vite de citations.
+
+    Source : `raw_data` rows avec `source='semantic_scholar'` et
+    `entity_type='paper'`. La `citationCount` est snapshottée à chaque
+    run du collecteur — un changement produit une nouvelle ligne (hash
+    différent). Pour chaque paper, on compare :
+
+    - le snapshot le plus récent (≤ as_of)
+    - le snapshot le plus ancien dans la fenêtre `[as_of - window, as_of]`
+
+    Si `latest - oldest >= delta_threshold`, alerte. Dedupe-key inclut
+    la date du jour pour autoriser une nouvelle alerte si le paper
+    continue à exploser le jalon suivant.
+    """
+
+    name = "citation_velocity"
+    severity = "warning"
+    source_name = "semantic_scholar"
+    entity_type = "paper"
+
+    def __init__(
+        self,
+        *,
+        delta_threshold: int = DEFAULT_CITATION_VELOCITY_DELTA,
+        window_days: int = DEFAULT_CITATION_VELOCITY_WINDOW_DAYS,
+    ) -> None:
+        if delta_threshold <= 0:
+            raise ValueError("delta_threshold doit être strictement positif")
+        if window_days <= 0:
+            raise ValueError("window_days doit être strictement positif")
+        self._delta = int(delta_threshold)
+        self._window_days = int(window_days)
+
+    def evaluate(self, as_of: datetime) -> list[AlertCandidate]:
+        since = as_of - timedelta(days=self._window_days)
+        # On ramène TOUS les snapshots de papers dans la fenêtre élargie.
+        # Pour chaque paperId, on retrouve le min et max de citation_count
+        # dans la fenêtre [since, as_of].
+        stmt = (
+            select(RawData.entity_id, RawData.fetched_at, RawData.payload_json)
+            .where(RawData.source == self.source_name)
+            .where(RawData.entity_type == self.entity_type)
+            .where(RawData.fetched_at >= since)
+            .where(RawData.fetched_at <= as_of)
+            .order_by(RawData.entity_id.asc(), RawData.fetched_at.asc())
+        )
+        with session_scope() as session:
+            rows = list(session.execute(stmt).all())
+
+        # Group par paper_id : prendre oldest_count + latest_count + meta.
+        by_paper: dict[str, dict[str, Any]] = {}
+        for entity_id, fetched_at, payload_json in rows:
+            try:
+                payload = _json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            count = payload.get("citation_count")
+            if count is None:
+                continue
+            entry = by_paper.get(entity_id)
+            if entry is None:
+                by_paper[entity_id] = {
+                    "oldest_count": count,
+                    "oldest_at": fetched_at,
+                    "latest_count": count,
+                    "latest_at": fetched_at,
+                    "title": payload.get("title"),
+                    "sector_id": payload.get("sector_id"),
+                }
+            else:
+                entry["latest_count"] = count
+                entry["latest_at"] = fetched_at
+
+        out: list[AlertCandidate] = []
+        for paper_id, e in by_paper.items():
+            delta = (e["latest_count"] or 0) - (e["oldest_count"] or 0)
+            if delta < self._delta:
+                continue
+            title = (e.get("title") or paper_id)[:80]
+            sector_id = e.get("sector_id")
+            msg = (
+                f"Paper « {title} » : +{delta} citations en "
+                f"{self._window_days} j "
+                f"(de {e['oldest_count']} → {e['latest_count']})."
+            )
+            out.append(AlertCandidate(
+                rule_name=self.name,
+                severity=self.severity,
+                message=msg,
+                # Une alerte par (paper, jour de l'observation latest) :
+                # si l'accélération continue, on alerte chaque jour
+                # nouveau snapshot — utile pour suivre les viral papers.
+                dedupe_key=(
+                    f"citation:{paper_id}:{e['latest_at'].date().isoformat()}"
+                ),
+                sector_id=sector_id,
+                data={
+                    "paper_id": paper_id,
+                    "delta": int(delta),
+                    "from": int(e["oldest_count"]),
+                    "to": int(e["latest_count"]),
+                    "window_days": self._window_days,
+                },
+            ))
+        return out
+
+
 #: Règles activées par défaut dans `AlertsEngine`. Ajouter ici les futures
-#: règles Phase 4+ (Form 13D, citations papers, …).
+#: règles (Form 13D buybacks…).
 DEFAULT_RULES: list[Rule] = [
     NewThesisRule(),
     EvaluationVerdictRule(),
     SectorHeatSurgeRule(),
     PDUFANearRule(),
     LargeGovContractRule(),
+    CitationVelocityRule(),
 ]
 
 
@@ -501,6 +614,7 @@ __all__ = [
     "SectorHeatSurgeRule",
     "PDUFANearRule",
     "LargeGovContractRule",
+    "CitationVelocityRule",
     "DEFAULT_RULES",
     "DEFAULT_NEW_THESIS_SCORE",
     "DEFAULT_VERDICT_STATUSES",
@@ -510,4 +624,6 @@ __all__ = [
     "DEFAULT_PDUFA_SCORE_THRESHOLD",
     "DEFAULT_LARGE_CONTRACT_THRESHOLD",
     "DEFAULT_LARGE_CONTRACT_LOOKBACK_DAYS",
+    "DEFAULT_CITATION_VELOCITY_DELTA",
+    "DEFAULT_CITATION_VELOCITY_WINDOW_DAYS",
 ]

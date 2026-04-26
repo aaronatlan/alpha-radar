@@ -8,6 +8,7 @@ import pytest
 
 from alerts.rules import (
     AlertCandidate,
+    CitationVelocityRule,
     EvaluationVerdictRule,
     LargeGovContractRule,
     NewThesisRule,
@@ -515,3 +516,123 @@ def test_large_contract_message_includes_amount_in_millions(tmp_db):
     _seed_contract(amount=125_500_000.0)
     c = LargeGovContractRule().evaluate(datetime(2026, 4, 25))[0]
     assert "125.5M" in c.message
+
+
+# ----------------------------------------------------- CitationVelocityRule
+
+
+def _seed_paper_snapshot(
+    *,
+    paper_id: str,
+    citation_count: int,
+    fetched_at: datetime,
+    title: str = "A great paper",
+    sector_id: str = "ai_ml",
+) -> None:
+    """Seed une ligne raw_data simulant un snapshot semantic_scholar."""
+    payload = {
+        "paper_id": paper_id,
+        "title": title,
+        "citation_count": citation_count,
+        "sector_id": sector_id,
+    }
+    with session_scope() as s:
+        s.add(RawData(
+            source="semantic_scholar",
+            entity_type="paper",
+            entity_id=paper_id,
+            fetched_at=fetched_at,
+            content_at=fetched_at,
+            payload_json=json.dumps(payload),
+            # Hash unique par snapshot (citation_count + fetched_at).
+            hash=f"h-{paper_id}-{citation_count}-{fetched_at.isoformat()}",
+        ))
+
+
+def test_citation_velocity_emits_when_delta_above_threshold(tmp_db):
+    paper = "p1"
+    _seed_paper_snapshot(paper_id=paper, citation_count=50,
+                         fetched_at=datetime(2026, 4, 20))
+    _seed_paper_snapshot(paper_id=paper, citation_count=200,
+                         fetched_at=datetime(2026, 4, 25))
+    cands = CitationVelocityRule().evaluate(datetime(2026, 4, 26))
+    assert len(cands) == 1
+    c = cands[0]
+    assert c.severity == "warning"
+    assert c.data["delta"] == 150
+    assert c.data["from"] == 50
+    assert c.data["to"] == 200
+    assert c.sector_id == "ai_ml"
+
+
+def test_citation_velocity_skips_when_delta_below(tmp_db):
+    _seed_paper_snapshot(paper_id="p1", citation_count=50,
+                         fetched_at=datetime(2026, 4, 20))
+    _seed_paper_snapshot(paper_id="p1", citation_count=80,
+                         fetched_at=datetime(2026, 4, 25))
+    assert CitationVelocityRule().evaluate(datetime(2026, 4, 26)) == []
+
+
+def test_citation_velocity_skips_single_snapshot(tmp_db):
+    """Sans baseline (1 seul snapshot) → delta = 0 → pas d'alerte."""
+    _seed_paper_snapshot(paper_id="p1", citation_count=500,
+                         fetched_at=datetime(2026, 4, 25))
+    assert CitationVelocityRule().evaluate(datetime(2026, 4, 26)) == []
+
+
+def test_citation_velocity_respects_window(tmp_db):
+    """Snapshot hors window n'est pas considéré comme baseline."""
+    paper = "p1"
+    _seed_paper_snapshot(paper_id=paper, citation_count=10,
+                         fetched_at=datetime(2026, 1, 1))   # >7j
+    _seed_paper_snapshot(paper_id=paper, citation_count=200,
+                         fetched_at=datetime(2026, 4, 25))
+    # Avec window=7, l'oldest dans la fenêtre = 200 → delta=0 → pas d'alerte.
+    rule = CitationVelocityRule(window_days=7)
+    assert rule.evaluate(datetime(2026, 4, 26)) == []
+
+
+def test_citation_velocity_dedupe_key_per_paper_per_day(tmp_db):
+    paper = "abc"
+    _seed_paper_snapshot(paper_id=paper, citation_count=10,
+                         fetched_at=datetime(2026, 4, 20))
+    _seed_paper_snapshot(paper_id=paper, citation_count=200,
+                         fetched_at=datetime(2026, 4, 25, 9, 0))
+    c = CitationVelocityRule().evaluate(datetime(2026, 4, 26))[0]
+    assert c.dedupe_key == "citation:abc:2026-04-25"
+
+
+def test_citation_velocity_handles_multiple_papers(tmp_db):
+    _seed_paper_snapshot(paper_id="A", citation_count=10,
+                         fetched_at=datetime(2026, 4, 20))
+    _seed_paper_snapshot(paper_id="A", citation_count=300,
+                         fetched_at=datetime(2026, 4, 25))   # +290
+    _seed_paper_snapshot(paper_id="B", citation_count=10,
+                         fetched_at=datetime(2026, 4, 20))
+    _seed_paper_snapshot(paper_id="B", citation_count=50,
+                         fetched_at=datetime(2026, 4, 25))   # +40 → skip
+    cands = CitationVelocityRule().evaluate(datetime(2026, 4, 26))
+    paper_ids = {c.data["paper_id"] for c in cands}
+    assert paper_ids == {"A"}
+
+
+def test_citation_velocity_handles_malformed_payload(tmp_db):
+    with session_scope() as s:
+        s.add(RawData(
+            source="semantic_scholar", entity_type="paper",
+            entity_id="bad", fetched_at=datetime(2026, 4, 25),
+            content_at=datetime(2026, 4, 25),
+            payload_json="not a json",
+            hash="h-bad",
+        ))
+    # Pas de crash, pas d'alerte.
+    assert CitationVelocityRule().evaluate(datetime(2026, 4, 26)) == []
+
+
+def test_citation_velocity_invalid_args_raise():
+    with pytest.raises(ValueError):
+        CitationVelocityRule(delta_threshold=0)
+    with pytest.raises(ValueError):
+        CitationVelocityRule(delta_threshold=-5)
+    with pytest.raises(ValueError):
+        CitationVelocityRule(window_days=0)
