@@ -130,7 +130,9 @@ def test_run_opens_position_on_buy_thesis(tmp_db):
     _seed_close("NVDA", 110.0, open_date + timedelta(days=1))
     _seed_close("NVDA", 110.0, open_date + timedelta(days=2))
 
-    sim = PortfolioSimulator(initial_capital=1.0)
+    # Frais à zéro ici pour vérifier le mark-to-market pur. Un test dédié
+    # plus bas vérifie l'effet des frais.
+    sim = PortfolioSimulator(initial_capital=1.0, fee_bps=0, slippage_bps=0)
     res = sim.run(start=open_date, end=open_date + timedelta(days=3))
     assert res.positions_taken == 1
     # Equity avant prise de position = 1.0, après +10% le 2e jour = 1.10.
@@ -163,7 +165,7 @@ def test_run_closes_position_after_horizon(tmp_db):
     _seed_close("NVDA", 110.0, open_date + timedelta(days=1))   # +10%
     _seed_close("NVDA", 200.0, open_date + timedelta(days=3))   # post-close
 
-    sim = PortfolioSimulator()
+    sim = PortfolioSimulator(fee_bps=0, slippage_bps=0)
     res = sim.run(start=open_date, end=open_date + timedelta(days=5))
     # Position fermée le 3e jour → equity finale ≈ 1.10 (pas 2.0).
     assert res.equity_curve[-1] == pytest.approx(1.10, rel=1e-2)
@@ -181,7 +183,7 @@ def test_run_equipondere_multiple_positions(tmp_db):
     _seed_close("A", 120.0, open_date + timedelta(days=1))
     _seed_close("B", 90.0, open_date + timedelta(days=1))
 
-    sim = PortfolioSimulator()
+    sim = PortfolioSimulator(fee_bps=0, slippage_bps=0)
     res = sim.run(start=open_date, end=open_date + timedelta(days=2))
     # Equity = 1.0 * 1.05.
     assert res.equity_curve[-1] == pytest.approx(1.05, rel=1e-2)
@@ -262,3 +264,74 @@ def test_run_filters_theses_outside_window(tmp_db):
     sim = PortfolioSimulator()
     res = sim.run(start=datetime(2026, 4, 1), end=datetime(2026, 4, 10))
     assert res.positions_taken == 0
+
+
+# ----------------------------------------------------------- frais / slippage
+
+
+def test_constructor_rejects_negative_costs():
+    with pytest.raises(ValueError):
+        PortfolioSimulator(fee_bps=-1)
+    with pytest.raises(ValueError):
+        PortfolioSimulator(slippage_bps=-0.01)
+
+
+def test_zero_costs_match_pre_fees_baseline(tmp_db):
+    """fee_bps=0 + slippage_bps=0 : equity exactement le P&L sous-jacent."""
+    open_date = datetime(2026, 4, 1)
+    _seed_thesis(asset_id="NVDA", created_at=open_date,
+                 entry_price=100.0, horizon_days=5)
+    _seed_close("NVDA", 100.0, open_date)
+    _seed_close("NVDA", 110.0, open_date + timedelta(days=1))
+    sim = PortfolioSimulator(fee_bps=0, slippage_bps=0)
+    res = sim.run(start=open_date, end=open_date + timedelta(days=2))
+    assert res.equity_curve[-1] == pytest.approx(1.10, rel=1e-9)
+
+
+def test_costs_reduce_equity_for_single_position(tmp_db):
+    """Sur 1 position seule, drag = 2 × cost_per_side. Avec
+    slippage_bps=10 et fee_bps=5 → 2 × 15 bps = 30 bps = 0.003."""
+    open_date = datetime(2026, 4, 1)
+    _seed_thesis(asset_id="NVDA", created_at=open_date,
+                 entry_price=100.0, horizon_days=5)
+    _seed_close("NVDA", 100.0, open_date)
+    _seed_close("NVDA", 110.0, open_date + timedelta(days=1))
+
+    sim_no = PortfolioSimulator(fee_bps=0, slippage_bps=0)
+    sim_yes = PortfolioSimulator(fee_bps=5, slippage_bps=10)
+
+    eq_no = sim_no.run(
+        start=open_date, end=open_date + timedelta(days=2)
+    ).equity_curve[-1]
+    eq_yes = sim_yes.run(
+        start=open_date, end=open_date + timedelta(days=2)
+    ).equity_curve[-1]
+
+    expected_drag = 2 * (5 + 10) / 10_000.0  # 30 bps round-trip
+    assert eq_yes == pytest.approx(eq_no * (1 - expected_drag), rel=1e-9)
+
+
+def test_costs_dilute_with_more_positions(tmp_db):
+    """Le drag par position est pondéré par 1/N_active : 2 positions
+    simultanées → drag/position diminue de moitié, mais on en paye 2."""
+    open_date = datetime(2026, 4, 1)
+    _seed_thesis(asset_id="A", created_at=open_date,
+                 entry_price=100.0, horizon_days=5)
+    _seed_thesis(asset_id="B", created_at=open_date,
+                 entry_price=100.0, horizon_days=5)
+    _seed_close("A", 100.0, open_date)
+    _seed_close("B", 100.0, open_date)
+    # Pas de mouvement de prix : on isole l'effet des frais.
+    sim = PortfolioSimulator(fee_bps=0, slippage_bps=10)
+    res = sim.run(start=open_date, end=open_date + timedelta(days=1))
+    # 2 positions, weight = 0.5 chacune, drag = 2 × 0.5 × 2 × 10 bps
+    # = 2 × 0.001 = 0.002 (somme = même drag que 1 position seule à 10 bps×2).
+    assert res.equity_curve[0] == pytest.approx(1 - 0.002, rel=1e-9)
+
+
+def test_default_costs_are_realistic(tmp_db):
+    """Sanity : par défaut, on a un slippage non nul. Un Sharpe pur
+    sans frais aurait été optimiste — c'est précisément ce que ces
+    defaults corrigent."""
+    sim = PortfolioSimulator()
+    assert sim._cost_per_side > 0

@@ -114,6 +114,24 @@ st.dataframe(
     hide_index=True,
 )
 
+# Raccourci vers la page détail. Streamlit ne propose pas de cellule
+# "lien" dans st.dataframe — on offre un selectbox + un lien direct
+# qui pré-sélectionne la thèse via query_param.
+st.markdown("**Voir le détail d'une thèse →**")
+selected = st.selectbox(
+    "Choisir une thèse",
+    options=df["thesis_id"].tolist(),
+    format_func=lambda i: f"#{i} — {df.loc[df['thesis_id'] == i, 'asset_id'].iloc[0]}",
+    label_visibility="collapsed",
+)
+st.page_link(
+    "pages/7_Thesis.py",
+    label=f"📝 Ouvrir la thèse #{selected}",
+)
+st.caption(
+    "Astuce : la page détail accepte `?thesis_id=N` dans l'URL pour le partage."
+)
+
 # ---------------------------------------------------------------- export CSV
 
 csv = df.to_csv(index=False).encode("utf-8")

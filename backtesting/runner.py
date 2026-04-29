@@ -107,11 +107,15 @@ def run_portfolio_mode(
     end: datetime,
     benchmark_tickers: list[str] | None = None,
     initial_capital: float = 1.0,
+    fee_bps: float = PortfolioSimulator.DEFAULT_FEE_BPS,
+    slippage_bps: float = PortfolioSimulator.DEFAULT_SLIPPAGE_BPS,
 ) -> dict[str, Any]:
     """Simule un portefeuille sur les thèses persistées entre start/end."""
     sim = PortfolioSimulator(
         initial_capital=initial_capital,
         benchmark_tickers=benchmark_tickers or [],
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
     )
     res = sim.run(start=start, end=end)
     return {
@@ -119,6 +123,8 @@ def run_portfolio_mode(
         "start": start.isoformat(),
         "end": end.isoformat(),
         "benchmark_tickers": list(benchmark_tickers or []),
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
         "result": _result_to_dict(res),
     }
 
@@ -138,6 +144,8 @@ def run_replay_mode(
     step_days: int = 1,
     benchmark_tickers: list[str] | None = None,
     initial_capital: float = 1.0,
+    fee_bps: float = PortfolioSimulator.DEFAULT_FEE_BPS,
+    slippage_bps: float = PortfolioSimulator.DEFAULT_SLIPPAGE_BPS,
 ) -> dict[str, Any]:
     """Re-joue scoring + thèses sur la fenêtre, puis simule le portfolio."""
     replay = HistoricalReplay(
@@ -149,6 +157,8 @@ def run_replay_mode(
     sim = PortfolioSimulator(
         initial_capital=initial_capital,
         benchmark_tickers=benchmark_tickers or [],
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
     )
     portfolio_res = sim.run(start=start, end=end)
     return {
@@ -156,6 +166,8 @@ def run_replay_mode(
         "start": start.isoformat(),
         "end": end.isoformat(),
         "step_days": step_days,
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
         "replay": _result_to_dict(replay_res),
         "portfolio": _result_to_dict(portfolio_res),
     }
@@ -192,9 +204,15 @@ def run_walk_forward_mode(
     selection_metric: str = "sharpe",
     test_ratio: float = 0.2,
     benchmark_tickers: list[str] | None = None,
+    fee_bps: float = PortfolioSimulator.DEFAULT_FEE_BPS,
+    slippage_bps: float = PortfolioSimulator.DEFAULT_SLIPPAGE_BPS,
 ) -> dict[str, Any]:
     """Walk-forward sur la base : suppose que les thèses des candidats existent."""
-    sim = PortfolioSimulator(benchmark_tickers=benchmark_tickers or [])
+    sim = PortfolioSimulator(
+        benchmark_tickers=benchmark_tickers or [],
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
     wf_res: WalkForwardResult = run_walk_forward(
         start=start,
         end=end,
@@ -239,6 +257,16 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--benchmark", default="",
                          help="Tickers benchmark, virgule (ex: 'SPY,QQQ').")
     common.add_argument("--initial-capital", type=float, default=1.0)
+    common.add_argument(
+        "--fee-bps", type=float,
+        default=PortfolioSimulator.DEFAULT_FEE_BPS,
+        help="Commission par côté en bps (défaut : retail commission-free).",
+    )
+    common.add_argument(
+        "--slippage-bps", type=float,
+        default=PortfolioSimulator.DEFAULT_SLIPPAGE_BPS,
+        help="Slippage par côté en bps (défaut : 5 bps ≈ retail liquide).",
+    )
     common.add_argument("--output", type=Path, default=None,
                          help="Fichier JSON de sortie. stdout si omis.")
 
@@ -279,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
             start=args.start, end=args.end,
             benchmark_tickers=benchmark,
             initial_capital=args.initial_capital,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
         )
     elif args.mode == "replay":
         report = run_replay_mode(
@@ -286,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
             step_days=args.step_days,
             benchmark_tickers=benchmark,
             initial_capital=args.initial_capital,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
         )
     elif args.mode == "walk-forward":
         weights = [w.strip() for w in args.weights.split(",") if w.strip()]
@@ -298,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
             selection_metric=args.selection_metric,
             test_ratio=args.test_ratio,
             benchmark_tickers=benchmark,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
         )
     else:   # pragma: no cover — argparse interdit
         raise SystemExit(f"Mode inconnu : {args.mode}")

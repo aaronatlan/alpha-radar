@@ -397,6 +397,142 @@ def acknowledge_alert(alert_id: int) -> bool:
 # --------------------------------------------------------------- theses history
 
 
+def list_thesis_ids() -> list[tuple[int, str, datetime]]:
+    """IDs disponibles pour le sélecteur de la page détail.
+
+    Liste triée du plus récent au plus ancien. Tuple (id, ticker, created_at)
+    pour pouvoir construire un libellé lisible côté UI sans 2e requête.
+    """
+    with session_scope() as session:
+        stmt = (
+            select(Thesis.id, Thesis.asset_id, Thesis.created_at)
+            .order_by(Thesis.created_at.desc())
+        )
+        return [(row[0], row[1], row[2]) for row in session.execute(stmt)]
+
+
+def get_thesis_detail(thesis_id: int) -> dict[str, Any] | None:
+    """Détail complet d'une thèse pour la page §7.9 Page 3.
+
+    Retourne `None` si la thèse n'existe pas. Sinon un dict avec :
+      - thesis : champs scalaires de la thèse (id, ticker, score, …)
+      - dimensions : sous-scores (peut être vide)
+      - triggers, risks, catalysts : listes JSON désérialisées
+      - evaluations : liste de jalons (dicts)
+      - latest_status / latest_alpha : raccourci sur le dernier jalon
+    Les JSON malformés se dégradent en `[]` / `{}` plutôt que crasher.
+    """
+    with session_scope() as session:
+        th = session.get(Thesis, thesis_id)
+        if th is None:
+            return None
+        evals_rows = session.execute(
+            select(Evaluation)
+            .where(Evaluation.thesis_id == thesis_id)
+            .order_by(Evaluation.days_since_thesis.asc())
+        ).scalars().all()
+
+        thesis_dict = {
+            "id": th.id,
+            "created_at": th.created_at,
+            "asset_type": th.asset_type,
+            "asset_id": th.asset_id,
+            "sector_id": th.sector_id,
+            "score": th.score,
+            "recommendation": th.recommendation,
+            "horizon_days": th.horizon_days,
+            "entry_price": th.entry_price,
+            "narrative": th.narrative,
+            "model_version": th.model_version,
+        }
+        breakdown = _safe_json(th.score_breakdown_json) or {}
+        triggers = _safe_json(th.triggers_json) or []
+        risks = _safe_json(th.risks_json) or []
+        catalysts = _safe_json(th.catalysts_json) or []
+        entry_conditions = _safe_json(th.entry_conditions_json) or {}
+
+        evaluations = [
+            {
+                "days_since_thesis": e.days_since_thesis,
+                "evaluated_at": e.evaluated_at,
+                "current_price": e.current_price,
+                "return_pct": e.return_pct,
+                "benchmark_return_pct": e.benchmark_return_pct,
+                "alpha_pct": e.alpha_pct,
+                "status": e.status,
+                "notes": e.notes,
+            }
+            for e in evals_rows
+        ]
+
+    latest = evaluations[-1] if evaluations else None
+    return {
+        "thesis": thesis_dict,
+        "dimensions": (breakdown.get("dimensions") if isinstance(breakdown, dict) else {}) or {},
+        "details": (breakdown.get("details") if isinstance(breakdown, dict) else {}) or {},
+        "triggers": triggers if isinstance(triggers, list) else [],
+        "risks": risks if isinstance(risks, list) else [],
+        "catalysts": catalysts if isinstance(catalysts, list) else [],
+        "entry_conditions": entry_conditions if isinstance(entry_conditions, dict) else {},
+        "evaluations": evaluations,
+        "latest_status": latest["status"] if latest else None,
+        "latest_alpha": latest["alpha_pct"] if latest else None,
+    }
+
+
+def get_price_history(
+    ticker: str,
+    *,
+    start: datetime,
+    end: datetime,
+    fetched_before: datetime | None = None,
+) -> pd.DataFrame:
+    """Closes journaliers PIT pour le graphique de la page détail.
+
+    Filtre `content_at` dans `[start, end]` et `fetched_at <= fetched_before`
+    (par défaut `end`) — on ne montre que des prix qui auraient été
+    observables à `fetched_before`. Colonnes : `date`, `close`.
+    """
+    cutoff = fetched_before or end
+    with session_scope() as session:
+        stmt = (
+            select(RawData.content_at, RawData.payload_json)
+            .where(RawData.source == "yfinance")
+            .where(RawData.entity_type == "ohlcv_daily")
+            .where(RawData.content_at >= start)
+            .where(RawData.content_at <= end)
+            .where(RawData.fetched_at <= cutoff)
+            .order_by(RawData.content_at.asc())
+        )
+        rows = session.execute(stmt).all()
+
+    out: list[dict[str, Any]] = []
+    for content_at, payload_json in rows:
+        payload = _safe_json(payload_json) or {}
+        if not isinstance(payload, dict) or payload.get("ticker") != ticker:
+            continue
+        close = payload.get("close")
+        if close is None:
+            close = payload.get("adj_close")
+        if close is None:
+            continue
+        try:
+            out.append({"date": content_at, "close": float(close)})
+        except (TypeError, ValueError):
+            continue
+    return pd.DataFrame(out, columns=["date", "close"])
+
+
+def _safe_json(blob: Any) -> Any:
+    """JSON parse silencieux (renvoie `None` si vide ou invalide)."""
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_theses_history(
     *,
     status_filter: list[str] | None = None,

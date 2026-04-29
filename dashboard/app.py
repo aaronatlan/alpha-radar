@@ -34,7 +34,12 @@ st.subheader("Navigation")
 st.write(
     "Utiliser le menu latéral pour accéder aux vues :\n"
     "- **Heat Map** — intensité par secteur (arXiv + GitHub).\n"
-    "- **Opportunities** — classement actions avec dimensions."
+    "- **Opportunities** — classement actions avec dimensions.\n"
+    "- **Performance** — track record global (alpha, taux de succès).\n"
+    "- **Alerts** — alertes actives et acquittées.\n"
+    "- **Memory** — historique complet des thèses + export CSV.\n"
+    "- **Backtest** — simulation portefeuille équipondéré.\n"
+    "- **Thèse** — vue détaillée d'une thèse (narrative, score, prix)."
 )
 
 

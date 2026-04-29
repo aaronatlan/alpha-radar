@@ -9,11 +9,22 @@ Modèle simplifié v1
 - À la date `created_at` de chaque thèse BUY/WATCH, on alloue une
   position de poids égal (1/N entre toutes les positions ouvertes).
 - La position se ferme automatiquement à `created_at + horizon_days`.
-- Pas de frais, pas de slippage, pas de stops — c'est un track record
-  hypothétique « si on avait suivi mécaniquement les recommandations ».
 - Les thèses `AVOID` sont ignorées (pas de short en v1).
 - Pour le P&L journalier d'une position, on lit le `close` PIT du
   ticker (yfinance ohlcv_daily) jour par jour.
+
+Frais & slippage
+----------------
+À l'ouverture de chaque position, on déduit du capital une charge
+round-trip = ``weight × 2 × (fee_bps + slippage_bps) / 1e4`` où
+``weight = 1 / N_active`` au moment de l'ouverture. Cette approximation
+modélise commissions et impact de marché à l'entrée + sortie comme un
+coût ponctuel — sans frais, le Sharpe et le total return sont
+sur-évalués de plusieurs centaines de bps sur un an.
+
+Defaults : ``fee_bps=0`` (retail commission-free), ``slippage_bps=5``
+par côté (≈ 10 bps round-trip, conservateur sur small/mid-caps liquides).
+Les modes 'replay' / 'walk-forward' héritent de ces mêmes coûts.
 
 Benchmark
 ---------
@@ -92,20 +103,35 @@ class PortfolioSimulator:
 
     DEFAULT_RECOMMENDATIONS: tuple[str, ...] = ("BUY", "WATCH")
 
+    #: Commission par côté en basis points (1 bp = 0.01%). Default retail
+    #: commission-free post-2019. Mettre 5–10 pour brokers traditionnels.
+    DEFAULT_FEE_BPS: float = 0.0
+
+    #: Slippage par côté en basis points. 5 bps ≈ 0.05% — couvre le coût
+    #: bid-ask + impact pour des petits notionnels sur tickers liquides.
+    DEFAULT_SLIPPAGE_BPS: float = 5.0
+
     def __init__(
         self,
         *,
         initial_capital: float = 1.0,
         accepted_recommendations: Sequence[str] = DEFAULT_RECOMMENDATIONS,
         benchmark_tickers: Sequence[str] | None = None,
+        fee_bps: float = DEFAULT_FEE_BPS,
+        slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     ) -> None:
         if initial_capital <= 0:
             raise ValueError("initial_capital doit être strictement positif")
         if not accepted_recommendations:
             raise ValueError("accepted_recommendations ne peut pas être vide")
+        if fee_bps < 0 or slippage_bps < 0:
+            raise ValueError("fee_bps et slippage_bps doivent être ≥ 0")
         self._initial_capital = float(initial_capital)
         self._accepted = tuple(accepted_recommendations)
         self._benchmark = tuple(benchmark_tickers or [])
+        # Conversion bps → fraction. `_cost_per_side` agrège commission
+        # et slippage car ils s'appliquent aux mêmes moments (entrée/sortie).
+        self._cost_per_side = (float(fee_bps) + float(slippage_bps)) / 10_000.0
 
     # --- API publique ----------------------------------------------------
 
@@ -140,6 +166,7 @@ class PortfolioSimulator:
 
         for current in dates:
             # 1) Ouverture de toutes les thèses dont created_at == current.
+            opened_today: list[Position] = []
             while thesis_idx < len(thesis_list) and \
                     thesis_list[thesis_idx].created_at <= current:
                 t = thesis_list[thesis_idx]
@@ -149,14 +176,28 @@ class PortfolioSimulator:
                 if t.entry_price is None or t.entry_price <= 0:
                     continue
                 close_date = t.created_at + timedelta(days=t.horizon_days)
-                positions.append(Position(
+                pos = Position(
                     ticker=t.asset_id,
                     open_date=t.created_at,
                     close_date=close_date,
                     open_price=float(t.entry_price),
                     last_price=float(t.entry_price),
-                ))
+                )
+                positions.append(pos)
+                opened_today.append(pos)
                 n_taken += 1
+
+            # 1b) Frais round-trip à l'ouverture. On calcule N_active
+            #     APRÈS ajout des nouvelles positions, donc le poids tient
+            #     compte de la dilution. Charge = w × 2 × cost_per_side
+            #     (entrée + sortie) appliquée immédiatement.
+            if opened_today and self._cost_per_side > 0:
+                active_after = [p for p in positions if p.is_active(current)]
+                n_active = len(active_after)
+                if n_active > 0:
+                    weight = 1.0 / n_active
+                    drag = weight * 2.0 * self._cost_per_side * len(opened_today)
+                    equity *= max(0.0, 1.0 - drag)
 
             # 2) Mark-to-market : pour chaque position ouverte, lire le
             #    close PIT et calculer la valeur courante.

@@ -45,6 +45,23 @@ with col_bench:
         help="Optionnel, ex : 'SPY' ou 'SPY,QQQ'.",
     )
 
+# Coûts d'exécution. Réglables pour comparer "monde idéal" vs réaliste.
+col_fee, col_slip = st.columns(2)
+with col_fee:
+    fee_bps = st.number_input(
+        "Frais (bps / côté)",
+        min_value=0.0, max_value=100.0,
+        value=float(PortfolioSimulator.DEFAULT_FEE_BPS), step=1.0,
+        help="Commission. 0 = retail commission-free post-2019.",
+    )
+with col_slip:
+    slippage_bps = st.number_input(
+        "Slippage (bps / côté)",
+        min_value=0.0, max_value=100.0,
+        value=float(PortfolioSimulator.DEFAULT_SLIPPAGE_BPS), step=1.0,
+        help="Impact bid-ask + market impact. 5 bps ≈ retail liquide.",
+    )
+
 if d_to <= d_from:
     st.error("La date de fin doit être strictement supérieure à la date de début.")
     st.stop()
@@ -55,7 +72,11 @@ benchmark = [t.strip() for t in bench_input.split(",") if t.strip()]
 
 # ---------------------------------------------------------------- run
 
-sim = PortfolioSimulator(benchmark_tickers=benchmark)
+sim = PortfolioSimulator(
+    benchmark_tickers=benchmark,
+    fee_bps=fee_bps,
+    slippage_bps=slippage_bps,
+)
 res = sim.run(start=start, end=end)
 
 if res.positions_taken == 0:

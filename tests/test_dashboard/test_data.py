@@ -13,10 +13,13 @@ from dashboard._data import (
     get_collector_health,
     get_feature_freshness,
     get_performance_summary,
+    get_price_history,
     get_sector_heat_scores,
     get_signal_performance,
     get_stock_scores,
     get_theses_history,
+    get_thesis_detail,
+    list_thesis_ids,
 )
 from memory.database import (
     Alert,
@@ -418,3 +421,154 @@ def test_get_theses_history_filter_by_date(tmp_db):
     df = get_theses_history(date_to=datetime(2026, 3, 1))
     assert len(df) == 1
     assert df.iloc[0]["asset_id"] == "NVDA"
+
+
+# ----------------------------------------------------- get_thesis_detail
+
+
+def _seed_close(
+    ticker: str, close: float, content_at: datetime,
+    fetched_at: datetime | None = None,
+) -> None:
+    fetched_at = fetched_at or content_at
+    with session_scope() as s:
+        s.add(RawData(
+            source="yfinance",
+            entity_type="ohlcv_daily",
+            entity_id=f"{ticker}:{content_at.strftime('%Y-%m-%d')}",
+            fetched_at=fetched_at,
+            content_at=content_at,
+            payload_json=json.dumps({"ticker": ticker, "close": close}),
+            hash=f"h-{ticker}-{content_at.strftime('%Y-%m-%d-%H-%M')}",
+        ))
+
+
+def test_list_thesis_ids_orders_by_recent_first(tmp_db):
+    t1 = _seed_thesis("NVDA", created_at=datetime(2026, 1, 1))
+    t2 = _seed_thesis("AMD", created_at=datetime(2026, 4, 1))
+    out = list_thesis_ids()
+    assert [tid for tid, _, _ in out] == [t2, t1]
+    assert out[0][1] == "AMD"
+
+
+def test_get_thesis_detail_unknown_returns_none(tmp_db):
+    assert get_thesis_detail(99999) is None
+
+
+def test_get_thesis_detail_returns_full_payload(tmp_db):
+    # Thèse riche : breakdown, triggers, risks, catalysts, entry_conditions.
+    with session_scope() as s:
+        th = Thesis(
+            created_at=datetime(2026, 1, 1),
+            asset_type="stock", asset_id="NVDA", sector_id="ai_ml",
+            score=82.5,
+            score_breakdown_json=json.dumps({
+                "dimensions": {"momentum": 90.0, "sentiment": 70.0},
+                "details": {"momentum": {"inputs": {"rsi_14": 65.0}}},
+            }),
+            recommendation="BUY", horizon_days=180, entry_price=120.0,
+            entry_conditions_json=json.dumps({"band_pct": 0.03}),
+            triggers_json=json.dumps([{"dimension": "momentum", "sub_score": 90.0}]),
+            risks_json=json.dumps([
+                {"category": "macro", "description": "Taux"},
+            ]),
+            catalysts_json=json.dumps([
+                {"type": "fda_approval", "date": "2026-03-01",
+                 "description": "Approval", "source": "fda"},
+            ]),
+            narrative="Markdown narrative.",
+            model_version="v1_test",
+            weights_snapshot_json="{}",
+        )
+        s.add(th)
+        s.flush()
+        thesis_id = th.id
+
+    _seed_eval(thesis_id, days=30, status="active", alpha_pct=None)
+    _seed_eval(thesis_id, days=180, status="success", alpha_pct=0.12)
+
+    detail = get_thesis_detail(thesis_id)
+    assert detail is not None
+    assert detail["thesis"]["asset_id"] == "NVDA"
+    assert detail["thesis"]["score"] == pytest.approx(82.5)
+    assert detail["dimensions"] == {"momentum": 90.0, "sentiment": 70.0}
+    assert detail["entry_conditions"]["band_pct"] == pytest.approx(0.03)
+    assert len(detail["triggers"]) == 1
+    assert len(detail["risks"]) == 1
+    assert detail["catalysts"][0]["type"] == "fda_approval"
+    assert len(detail["evaluations"]) == 2
+    # Le dernier jalon (180) doit être le "latest".
+    assert detail["latest_status"] == "success"
+    assert detail["latest_alpha"] == pytest.approx(0.12)
+
+
+def test_get_thesis_detail_handles_malformed_json(tmp_db):
+    """Un JSON invalide ne doit pas faire planter la page détail."""
+    with session_scope() as s:
+        th = Thesis(
+            created_at=datetime(2026, 1, 1),
+            asset_type="stock", asset_id="NVDA", sector_id="ai_ml",
+            score=70.0,
+            score_breakdown_json="not json",
+            recommendation="WATCH", horizon_days=180, entry_price=100.0,
+            triggers_json="not json",
+            risks_json="not json",
+            catalysts_json="not json",
+            narrative="…",
+            model_version="v1",
+            weights_snapshot_json="{}",
+        )
+        s.add(th)
+        s.flush()
+        tid = th.id
+
+    detail = get_thesis_detail(tid)
+    assert detail is not None
+    assert detail["dimensions"] == {}
+    assert detail["triggers"] == []
+    assert detail["risks"] == []
+    assert detail["catalysts"] == []
+
+
+# ----------------------------------------------------- get_price_history
+
+
+def test_get_price_history_empty(tmp_db):
+    df = get_price_history(
+        "NVDA",
+        start=datetime(2026, 1, 1),
+        end=datetime(2026, 4, 1),
+    )
+    assert df.empty
+    assert list(df.columns) == ["date", "close"]
+
+
+def test_get_price_history_filters_window_and_ticker(tmp_db):
+    _seed_close("NVDA", 100.0, datetime(2026, 3, 1))
+    _seed_close("NVDA", 110.0, datetime(2026, 3, 5))
+    _seed_close("AMD", 50.0, datetime(2026, 3, 1))    # autre ticker
+    _seed_close("NVDA", 200.0, datetime(2025, 1, 1))  # hors fenêtre
+
+    df = get_price_history(
+        "NVDA",
+        start=datetime(2026, 2, 1),
+        end=datetime(2026, 4, 1),
+    )
+    assert list(df["close"]) == [100.0, 110.0]
+
+
+def test_get_price_history_respects_fetched_before(tmp_db):
+    """Un close fetché APRÈS `fetched_before` n'est pas visible (PIT)."""
+    # Close datant du 5/3 mais ingéré le 10/3.
+    _seed_close(
+        "NVDA", 110.0,
+        content_at=datetime(2026, 3, 5),
+        fetched_at=datetime(2026, 3, 10),
+    )
+    df = get_price_history(
+        "NVDA",
+        start=datetime(2026, 2, 1),
+        end=datetime(2026, 4, 1),
+        fetched_before=datetime(2026, 3, 7),  # avant la fetch → exclu
+    )
+    assert df.empty
